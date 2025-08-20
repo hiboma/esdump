@@ -99,7 +99,7 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 		}
 		//提交数据
 		req:= elastic.NewBulkIndexRequest()
-		req.Id(item.ID).Doc(item.RawData)
+		req.Id(item.ID).Doc(item.Source)
 		iserv.Add(req)
 		if iserv.NumberOfActions()>999{
 			_,err=iserv.Do(context.Background())
@@ -204,7 +204,7 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	for  chanItem := range dataChan {
 		storeCount +=1
 		hit:=chanItem.(elastic.SearchHit)
-		item:=hitItem{hit.Id,hit.Source}
+		item:=hitItem{hit.Index, hit.Id, 1, hit.Source}
 		bs,_:=json.Marshal(&item)
 		_, err = outputWriter.Write(bs)
 		_, err = outputWriter.Write([]byte("\n"))
@@ -236,6 +236,8 @@ func getMb(size int64) float64{
 	return tmpf
 }
 type hitItem struct {
-	ID string
-	RawData json.RawMessage
+	Index  string          `json:"_index"`
+	ID     string          `json:"_id"`
+	Score  int             `json:"_score"`
+	Source json.RawMessage `json:"_source"`
 }
