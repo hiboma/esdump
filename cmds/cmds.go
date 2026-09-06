@@ -190,6 +190,17 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 					goto END
 				}
 			}
+			// io.EOF は scroll を読み切ったことを示す正常終了の合図であり、
+			// エラーではない。olivere/elastic の ScrollService.Do は
+			// ヒットが 0 件になった時点で io.EOF を返す。
+			//
+			// 最終ページのヒット数が Size 未満であれば上の分岐で END へ抜ける。
+			// しかし総件数が Size の倍数ちょうどのときは最終ページが Size と
+			// 同数になり、次の Do が 0 件 + io.EOF を返す。ここを異常終了として
+			// 扱うと、全件を読み終えているのにプロセスが落ちて出力が失われる。
+			if errors.Is(err, io.EOF) {
+				goto END
+			}
 			if err != nil {
 				log.Fatalln("ScrollService err", err)
 			}
