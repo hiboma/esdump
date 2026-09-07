@@ -13,6 +13,8 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 var exportCmd = &cobra.Command{
@@ -54,6 +56,25 @@ var ProgressEvery int
 // PagesEvery はフェッチ時間のログを何ページごとに出すかである。0 で出力しない。
 var PagesEvery int
 
+// PageSize は scroll の 1 ページあたりの取得件数である。
+//
+// 終了判定がこの値との比較で行われるため、定数ではなく変数として持つ。
+// ハードコードした 100 と突き合わせると、値を変えたときに最終ページを
+// 検出できず、無限ループか取りこぼしになる。
+var PageSize int
+
+// Slices は scroll を何本に分割して並行に読むかである。1 で分割しない。
+//
+// OpenSearch の sliced scroll を使う。1 つのインデックスを N 個の互いに
+// 素な部分集合に分け、それぞれを独立した scroll として同時に読める。
+// 単一 scroll は前のページが返るまで次を要求できないため、ここが
+// 取得速度の上限になっている。
+//
+// 分割数はシャード数に合わせるのが定石である。シャード数より多くすると
+// 1 シャードを複数のスライスが読むことになり、OpenSearch 側の負荷だけが
+// 増える。
+var Slices int
+
 func init(){
 	exportCmd.Flags().StringVarP(&Output,"o","o","./tmp_export.json.gz","export dest filename; use - for stdout")
 	exportCmd.Flags().IntVarP(&MaxDocs,"c","c",0,"set the max amount of documents to be exported; default(0) will exported all matched document; ")
@@ -61,6 +82,8 @@ func init(){
 	exportCmd.Flags().BoolVar(&enableGzip,"gzip",true,"enable gzip; to disable gzip add parameter \"--gzip=false\"")
 	exportCmd.Flags().IntVar(&ProgressEvery,"progress-every",10000,"log export progress every N documents; 0 disables progress logging")
 	exportCmd.Flags().IntVar(&PagesEvery,"pages-every",1000,"log fetch time every N pages; 0 disables fetch time logging")
+	exportCmd.Flags().IntVar(&PageSize,"size",100,"scroll page size; number of documents fetched per request")
+	exportCmd.Flags().IntVar(&Slices,"slices",1,"number of sliced scrolls to read in parallel; 1 disables slicing; match the index shard count")
 
 	importCmd.Flags().StringVarP(&Input,"i","i","./tmp_import.json.gz","import filename; use - for stdin")
 	importCmd.Flags().BoolVar(&enableGzip,"gzip",true,"enable gzip; to disable gzip add parameter \"--gzip=false\"")
@@ -137,6 +160,83 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 	log.Printf("finish import row count %d",counter)
 	return
 }
+// fetchSlice は 1 本の scroll を読み切り、ヒットを dataChan へ送る。
+//
+// slices が 1 のときは分割せず、インデックス全体を 1 本の scroll で読む。
+// 2 以上のときは sliced scroll を使い、sliceID 番目の部分集合だけを読む。
+// 各スライスは互いに素な集合を返すため、全スライスの和が全件になる。
+//
+// scroll は前のレスポンスが返す scroll ID がないと次を要求できず、本質的に
+// 逐次である。並行化はスライスを分ける以外に方法がない。
+//
+// count と totalFetchTime は全スライスで共有する。atomic で更新すること。
+func fetchSlice(esUrl, indexName, matchBody string, pageSize, sliceID, slices int,
+	dataChan chan<- interface{}, count *int64, totalFetchTime *int64) {
+
+	ss := GetEsScrollService(esUrl, indexName)
+	if matchBody != "" {
+		rawQuery := elastic.NewRawStringQuery(matchBody)
+		ss = ss.Query(rawQuery)
+		if sliceID == 0 {
+			log.Println("export match:", matchBody)
+		}
+	}
+	if slices > 1 {
+		ss = ss.Slice(elastic.NewSliceQuery().Id(sliceID).Max(slices))
+	}
+	pager := ss.Size(pageSize)
+
+	pcounter := 0
+	fetchTime := 0.0
+
+	for {
+		startTime := time.Now()
+		res, err := pager.Do(context.Background())
+		spend := time.Now().Sub(startTime).Seconds()
+		fetchTime += spend
+		atomic.AddInt64(totalFetchTime, int64(time.Duration(spend*float64(time.Second))))
+		pcounter++
+		// 0 は無効を意味する。剰余は 0 で panic するため必ず先に弾く。
+		if PagesEvery > 0 && pcounter%PagesEvery == 0 {
+			if slices > 1 {
+				log.Printf("slice %d: %d pages FetchTime %v s", sliceID, PagesEvery, fetchTime)
+			} else {
+				log.Printf("%d pages FetchTime %v s", PagesEvery, fetchTime)
+			}
+			fetchTime = 0
+		}
+		if err == nil {
+			for _, hit := range res.Hits.Hits {
+				dataChan <- *hit
+				// MaxDocs は全スライス合計で判定する。スライスごとに数えると
+				// slices 倍の件数を取得してしまう。
+				n := atomic.AddInt64(count, 1)
+				if MaxDocs > 0 && n >= int64(MaxDocs) {
+					return
+				}
+			}
+			// 最終ページはヒット数が Size 未満になる。
+			if len(res.Hits.Hits) < pageSize {
+				return
+			}
+		}
+		// io.EOF は scroll を読み切ったことを示す正常終了の合図であり、
+		// エラーではない。olivere/elastic の ScrollService.Do は
+		// ヒットが 0 件になった時点で io.EOF を返す。
+		//
+		// 最終ページのヒット数が Size 未満であれば上の分岐で抜ける。
+		// しかし総件数が Size の倍数ちょうどのときは最終ページが Size と
+		// 同数になり、次の Do が 0 件 + io.EOF を返す。ここを異常終了として
+		// 扱うと、全件を読み終えているのにプロセスが落ちて出力が失われる。
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		if err != nil {
+			log.Fatalln("ScrollService err", err)
+		}
+	}
+}
+
 func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	var ofile *os.File
 	if outputFile=="-"{
@@ -165,62 +265,36 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 
 	outputWriter:=bufio.NewWriterSize(targetWriter,1<<22)
 	defer outputWriter.Flush()
-	ss:=GetEsScrollService(esUrl,indexName)
-	if matchBody!=""{
-		rawQuery:=elastic.NewRawStringQuery(matchBody)
-		ss=ss.Query(rawQuery)
-		log.Println("export match:",matchBody)
+	pageSize := PageSize
+	if pageSize <= 0 {
+		pageSize = 100
 	}
-	pager:=ss.Size(100)//.Query(elastic.MatchAllQuery{})
-	pcounter := 0
-	count :=0
+	slices := Slices
+	if slices <= 0 {
+		slices = 1
+	}
+
 	dataChan :=make(chan interface{},300)
-	fetchTime:=0.0
-	totalFetchTime:=0.0
+
+	// count は全スライス合計の取得件数である。MaxDocs の判定に使うため
+	// atomic で更新する。スライスごとの独立したカウンタでは、合計が
+	// MaxDocs を超えてから止まることになる。
+	var count int64
+	var totalFetchTime int64 // ナノ秒。複数のスライスから加算する
+
+	var wg sync.WaitGroup
+	for i := 0; i < slices; i++ {
+		wg.Add(1)
+		go func(sliceID int) {
+			defer wg.Done()
+			fetchSlice(esUrl, indexName, matchBody, pageSize, sliceID, slices, dataChan, &count, &totalFetchTime)
+		}(i)
+	}
+
 	go func() {
-		defer close(dataChan)
-		for {
-			//for test
-			startTime := time.Now()
-			res, err := pager.Do(context.Background())
-			spend:=time.Now().Sub(startTime).Seconds()
-			fetchTime += spend
-			totalFetchTime+=spend
-			pcounter++;
-			// 0 は無効を意味する。剰余は 0 で panic するため必ず先に弾く。
-			if PagesEvery > 0 && pcounter % PagesEvery ==0 {
-				log.Printf("%d pages FetchTime %v s", PagesEvery, fetchTime)
-				fetchTime=0
-			}
-			if err == nil {
-				for _, hit := range res.Hits.Hits {
-					dataChan <- *hit
-					count++
-					if MaxDocs > 0 && count >= MaxDocs {
-						goto END
-					}
-				}
-				if len(res.Hits.Hits) < 100 {
-					goto END
-				}
-			}
-			// io.EOF は scroll を読み切ったことを示す正常終了の合図であり、
-			// エラーではない。olivere/elastic の ScrollService.Do は
-			// ヒットが 0 件になった時点で io.EOF を返す。
-			//
-			// 最終ページのヒット数が Size 未満であれば上の分岐で END へ抜ける。
-			// しかし総件数が Size の倍数ちょうどのときは最終ページが Size と
-			// 同数になり、次の Do が 0 件 + io.EOF を返す。ここを異常終了として
-			// 扱うと、全件を読み終えているのにプロセスが落ちて出力が失われる。
-			if errors.Is(err, io.EOF) {
-				goto END
-			}
-			if err != nil {
-				log.Fatalln("ScrollService err", err)
-			}
-		}
-	END:
-		log.Println("totalFetchTime", totalFetchTime, "s")
+		wg.Wait()
+		close(dataChan)
+		log.Println("totalFetchTime", time.Duration(atomic.LoadInt64(&totalFetchTime)).Seconds(), "s")
 	}()
 
 	storeTime :=0.0
