@@ -62,6 +62,8 @@ make release-snapshot  # publish せずに dist/ へ成果物をビルドする
 
 - `.tagpr` — tagpr の設定。`release = false` にして GitHub Release の作成は GoReleaser に任せています
 - `.goreleaser.yml` — ビルド対象は darwin/linux の amd64, arm64 の4種です
+  - 旧ワークフローが配布していた windows-amd64 は対象外にしました
+  - アーカイブ名のバージョンには `v` が付きません。タグ `v1.2.3` に対して `esdump_1.2.3_linux_amd64.tar.gz` です
 - `.github/workflows/tagpr.yml` — tagpr と GoReleaser を1つのジョブで実行します
 
 **重要**: tagpr が `GITHUB_TOKEN` で打ったタグは push イベントを発火しません

@@ -107,9 +107,13 @@ Download a prebuilt binary from [Releases](https://github.com/hiboma/esdump/rele
 
 ```shell script
 # example: linux amd64
-curl -sL https://github.com/hiboma/esdump/releases/latest/download/esdump_<VERSION>_linux_amd64.tar.gz | tar xz
+TAG=$(curl -s https://api.github.com/repos/hiboma/esdump/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+curl -sL "https://github.com/hiboma/esdump/releases/download/${TAG}/esdump_${TAG#v}_linux_amd64.tar.gz" | tar xz
 ./esdump version
 ```
+
+Archive names carry the version without the leading `v`, while the tag keeps it:
+tag `v1.2.3` produces `esdump_1.2.3_linux_amd64.tar.gz`.
 
 Binaries are built for `darwin/amd64`, `darwin/arm64`, `linux/amd64` and `linux/arm64`.
 `checksums.txt` is attached to every release.
