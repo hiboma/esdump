@@ -100,3 +100,37 @@ one document one row.
 the field "RawData" in the  document.
 
 sorry my bad english
+
+## Install
+
+Download a prebuilt binary from [Releases](https://github.com/hiboma/esdump/releases).
+
+```shell script
+# example: linux amd64
+curl -sL https://github.com/hiboma/esdump/releases/latest/download/esdump_<VERSION>_linux_amd64.tar.gz | tar xz
+./esdump version
+```
+
+Binaries are built for `darwin/amd64`, `darwin/arm64`, `linux/amd64` and `linux/arm64`.
+`checksums.txt` is attached to every release.
+
+## Release flow
+
+Releases are automated with [tagpr](https://github.com/Songmu/tagpr) and
+[GoReleaser](https://goreleaser.com/).
+
+1. Merge changes into `master`.
+2. tagpr opens (or updates) a release pull request that bumps the version and
+   updates `CHANGELOG.md`.
+   Add a `minor` or `major` label to that pull request to control the bump;
+   without a label the patch version is bumped.
+3. Merging the release pull request makes tagpr push the `vX.Y.Z` tag, and the
+   same workflow run then invokes GoReleaser to build the binaries and publish
+   the GitHub Release.
+
+To verify the release configuration locally:
+
+```shell script
+make release-check      # validate .goreleaser.yml
+make release-snapshot   # build artifacts into dist/ without publishing
+```
