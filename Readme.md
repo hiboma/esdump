@@ -203,6 +203,12 @@ Releases are automated with [tagpr](https://github.com/Songmu/tagpr) and
    same workflow run then invokes GoReleaser to build the binaries and publish
    the GitHub Release.
 
+This requires **Allow GitHub Actions to create and approve pull requests** to be
+enabled under Settings > Actions > General. GitHub does not separate creating a
+pull request from approving one, so tagpr cannot open its release pull request
+without it. Workflow permissions themselves can stay at read-only, since
+`tagpr.yml` declares what it needs per job.
+
 To verify the release configuration locally:
 
 ```shell script
