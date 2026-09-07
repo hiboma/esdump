@@ -23,6 +23,38 @@ go build
 **note**:
 - when use import;  you should setting the target index's _mapping .
 
+## logging options
+
+Exporting a large index writes a lot of progress lines. `export` logs one line
+every 10,000 documents by default, so an index of 200 million documents produces
+more than 20,000 lines. That can fill up log rotation with progress lines alone
+and bury errors. Use `--progress-every` to widen the interval, or `0` to turn
+progress logging off.
+
+```shell script
+# one line every 100,000 documents instead of every 10,000
+./esdump export --index my_index -o - --progress-every 100000
+
+# no progress lines and no fetch time lines at all
+./esdump export --index my_index -o - --progress-every 0 --pages-every 0
+```
+
+Log timestamps have no timezone in them. They are written in the local timezone,
+so the same line means different things depending on where it was produced, and
+`2026/09/07 12:42:55` cannot be told apart from a UTC timestamp. Use
+`--log-timezone` to pin the timezone explicitly.
+
+```shell script
+./esdump export --index my_index -o - --log-timezone Asia/Tokyo
+./esdump export --index my_index -o - --log-timezone UTC
+```
+
+An unknown timezone name exits with an error rather than falling back, so a long
+running export cannot end up with timestamps in an unintended timezone.
+
+The defaults keep the current behaviour: progress every 10,000 documents, fetch
+time every 1,000 pages, and timestamps in the local timezone.
+
 
 command help:
 ```shell script

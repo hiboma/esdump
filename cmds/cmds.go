@@ -43,11 +43,24 @@ var MatchBody string
 
 var Input string
 var enableGzip bool
+
+// ProgressEvery は進捗ログを何件ごとに出すかである。0 で出力しない。
+//
+// 既定の 10000 件は 1 億件を超えるインデックスで 1 万行以上になり、
+// logrotate の世代を進捗ログだけで埋める。その中に埋もれるとエラーや
+// 転送完了の行を追えなくなるため、呼び出し側で間隔を選べるようにする。
+var ProgressEvery int
+
+// PagesEvery はフェッチ時間のログを何ページごとに出すかである。0 で出力しない。
+var PagesEvery int
+
 func init(){
 	exportCmd.Flags().StringVarP(&Output,"o","o","./tmp_export.json.gz","export dest filename; use - for stdout")
 	exportCmd.Flags().IntVarP(&MaxDocs,"c","c",0,"set the max amount of documents to be exported; default(0) will exported all matched document; ")
 	exportCmd.Flags().StringVarP(&MatchBody,"MatchBody","m","{\"match_all\":{}}","MatchBody, empty for match_all; example:{\"range\": {\"timestamp\": {\"gte\": \"2021-04-20\"}}}")
 	exportCmd.Flags().BoolVar(&enableGzip,"gzip",true,"enable gzip; to disable gzip add parameter \"--gzip=false\"")
+	exportCmd.Flags().IntVar(&ProgressEvery,"progress-every",10000,"log export progress every N documents; 0 disables progress logging")
+	exportCmd.Flags().IntVar(&PagesEvery,"pages-every",1000,"log fetch time every N pages; 0 disables fetch time logging")
 
 	importCmd.Flags().StringVarP(&Input,"i","i","./tmp_import.json.gz","import filename; use - for stdin")
 	importCmd.Flags().BoolVar(&enableGzip,"gzip",true,"enable gzip; to disable gzip add parameter \"--gzip=false\"")
@@ -174,8 +187,9 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 			fetchTime += spend
 			totalFetchTime+=spend
 			pcounter++;
-			if pcounter % 1000 ==0 {
-				log.Println("1000 pages FetchTime", fetchTime, "s")
+			// 0 は無効を意味する。剰余は 0 で panic するため必ず先に弾く。
+			if PagesEvery > 0 && pcounter % PagesEvery ==0 {
+				log.Printf("%d pages FetchTime %v s", PagesEvery, fetchTime)
 				fetchTime=0
 			}
 			if err == nil {
@@ -224,7 +238,8 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 			break
 		}
 		bsCounter+=len(bs)
-		if storeCount%10000==0{
+		// 0 は無効を意味する。剰余は 0 で panic するため必ず先に弾く。
+		if ProgressEvery > 0 && storeCount%ProgressEvery==0{
 			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
 			storeTime =0
 		}
