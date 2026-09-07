@@ -5,13 +5,17 @@ on:
     branches:
       - master
 
-permissions:
-  contents: write
-  pull-requests: write
+# ジョブ単位で宣言し、将来ジョブを追加したときに権限が継承されないようにする
+permissions: {}
 
 jobs:
   tagpr:
     runs-on: ubuntu-latest
+    permissions:
+      # tagpr のタグ push と goreleaser の Release 作成
+      contents: write
+      # tagpr のリリース PR の作成と更新
+      pull-requests: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
