@@ -1,0 +1,7 @@
+# https://github.com/Songmu/tagpr
+[tagpr]
+	vPrefix = true
+	releaseBranch = master
+	versionFile = -
+	# GitHub Release は goreleaser が作成するため tagpr では作らない
+	release = false

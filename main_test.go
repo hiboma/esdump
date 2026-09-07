@@ -22,5 +22,8 @@ func Test_Gzip(t *testing.T){
 
 }
 func Test_Export(t *testing.T){
+	if testing.Short() {
+		t.Skip("Elasticsearch に接続するため -short ではスキップする")
+	}
 	cmds.ExportData(cmds.Output,"http://brige:9200","tmp_index","")
 }

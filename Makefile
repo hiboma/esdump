@@ -133,3 +133,13 @@ lint:
 
 clean:
 	rm $(BINDIR)/*
+# --- release (goreleaser) ---
+# 実際のリリースは tag を打つと GitHub Actions が実行する。
+# 以下は手元で設定と成果物を検証するためのターゲット。
+.PHONY: release-check release-snapshot
+
+release-check:
+	goreleaser check
+
+release-snapshot:
+	goreleaser release --snapshot --clean --skip=publish

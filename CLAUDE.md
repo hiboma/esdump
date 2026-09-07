@@ -42,6 +42,34 @@ go test -v          # 詳細出力付きテスト実行
 make clean          # binディレクトリ内のバイナリを削除
 ```
 
+### リリース設定の検証
+```bash
+make release-check     # .goreleaser.yml を検証する
+make release-snapshot  # publish せずに dist/ へ成果物をビルドする
+```
+
+## リリースフロー
+
+リリースは tagpr と GoReleaser で自動化しています。
+
+1. master に変更をマージします
+2. tagpr がバージョンを上げ CHANGELOG.md を更新するリリース PR を作成または更新します
+   - PR に `minor` / `major` ラベルを付けると bump の種類を制御できます。無ラベルなら patch です
+3. リリース PR をマージすると tagpr が `vX.Y.Z` タグを push し、同じワークフロー実行の中で
+   GoReleaser がバイナリをビルドして GitHub Release を公開します
+
+設定ファイル:
+
+- `.tagpr` — tagpr の設定。`release = false` にして GitHub Release の作成は GoReleaser に任せています
+- `.goreleaser.yml` — ビルド対象は darwin/linux の amd64, arm64 の4種です
+  - 旧ワークフローが配布していた windows-amd64 は対象外にしました
+  - アーカイブ名のバージョンには `v` が付きません。タグ `v1.2.3` に対して `esdump_1.2.3_linux_amd64.tar.gz` です
+- `.github/workflows/tagpr.yml` — tagpr と GoReleaser を1つのジョブで実行します
+
+**重要**: tagpr が `GITHUB_TOKEN` で打ったタグは push イベントを発火しません
+(GitHub の無限ループ防止仕様)。そのためリリースを別ワークフローに分けず、
+タグを打った同じジョブ内で `steps.tagpr.outputs.tag` を条件に GoReleaser を実行しています。
+
 ## アーキテクチャ
 
 ### プロジェクト構造
