@@ -29,3 +29,4 @@ log.log
 bin/
 .conf.yaml
 stock/
+dist/
