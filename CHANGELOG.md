@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.0.2](https://github.com/hiboma/esdump/compare/v0.0.1...v0.0.2) - 2026-09-07
+
+- feat: ログの出力間隔とタイムゾーンをオプションで指定できるようにする by @hiboma in https://github.com/hiboma/esdump/pull/4
+- feat: parallel export with sliced scroll (--slices, --size) by @hiboma in https://github.com/hiboma/esdump/pull/9
+
 ## [v0.0.1](https://github.com/hiboma/esdump/commits/v0.0.1) - 2026-09-07
 
 - add CLAUDE.md by @hiboma in https://github.com/hiboma/esdump/pull/1
