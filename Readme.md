@@ -231,6 +231,13 @@ The container listens on `127.0.0.1:19217`. Port 9200 is deliberately avoided
 so it does not clash with another Elasticsearch or OpenSearch on the same
 machine. Override the endpoint with `ESDUMP_TEST_ES`.
 
+The integration tests delete and recreate the indices they seed, so two guards
+stand in the way of doing that to something you care about: the endpoint has to
+resolve to a loopback host unless `ESDUMP_TEST_ALLOW_REMOTE=1` says otherwise,
+and every seeded index name has to start with `esdump_test_`. A health check
+cannot serve as that guard — a production cluster answers it more reliably than
+a container you forgot to start.
+
 ### Seeding a larger index by hand
 
 The integration tests seed a few hundred documents each, which is enough for

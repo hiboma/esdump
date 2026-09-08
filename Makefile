@@ -159,7 +159,8 @@ test:
 	go test ./... -timeout 600s
 
 # test/short は OpenSearch を必要としないテストだけを走らせる。
-# CI の既定はこちらである。
+# 手元で素早く回すためのターゲットである。CI は test/integration と同じ
+# 条件で全テストを実行する。
 test/short:
 	go test ./... -short -timeout 120s
 
