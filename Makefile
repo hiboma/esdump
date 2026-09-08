@@ -143,3 +143,45 @@ release-check:
 
 release-snapshot:
 	goreleaser release --snapshot --clean --skip=publish
+
+# --- 統合テスト (OpenSearch コンテナ) ---
+#
+# sliced scroll の全件性やページ境界は、実際の scroll API を叩かないと
+# 検証できない。compose.yml の OpenSearch を起動してテストを走らせる。
+#
+# ホスト側のポートは 19217 である。9200 を避けているのは、開発機で動く
+# 他の Elasticsearch / OpenSearch と衝突させないためである。
+.PHONY: test test/short test/up test/down test/integration test/logs test/seed
+
+# test は統合テストを含む全テストである。コンテナが起動していなければ
+# 統合テストはスキップされる。
+test:
+	go test ./... -timeout 600s
+
+# test/short は OpenSearch を必要としないテストだけを走らせる。
+# CI の既定はこちらである。
+test/short:
+	go test ./... -short -timeout 120s
+
+test/up:
+	docker compose up -d --wait
+
+test/down:
+	docker compose down -v
+
+# test/integration は起動から実行、停止までを通す。
+# ESDUMP_TEST_ES_REQUIRED=1 を付けることで、コンテナに繋がらない場合を
+# スキップではなく失敗として扱う。CI で「静かにスキップされていた」を
+# 防ぐためである。
+test/integration: test/up
+	ESDUMP_TEST_ES_REQUIRED=1 go test ./... -v -timeout 600s
+
+test/logs:
+	docker compose logs -f opensearch
+
+# test/seed は手動検証用のインデックスを作る。件数とシャード数を渡せる。
+#   make test/seed COUNT=1000000 SHARDS=5
+COUNT ?= 100000
+SHARDS ?= 3
+test/seed: test/up
+	./script/seed.sh $(COUNT) $(SHARDS)

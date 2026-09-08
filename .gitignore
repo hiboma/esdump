@@ -30,3 +30,6 @@ bin/
 .conf.yaml
 stock/
 dist/
+
+# 手動検証で作った export の出力
+*.json.gz
