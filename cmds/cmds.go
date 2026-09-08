@@ -6,11 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/olivere/elastic/v7"
 	"github.com/spf13/cobra"
 	"io"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -170,8 +172,14 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 // 逐次である。並行化はスライスを分ける以外に方法がない。
 //
 // count と totalFetchTime は全スライスで共有する。atomic で更新すること。
+//
+// エラーは戻り値で返す。以前はここで log.Fatalln していたが、os.Exit は
+// ExportData の defer を実行しない。gzip writer の Close とバッファの Flush が
+// 飛ぶため、それまでに取得したデータが失われ、出力ファイルは途中で切れた
+// 不完全な gzip ストリームになる。数時間かけた export の終盤で 1 度エラーが
+// 出ただけで成果物全体が使えなくなる。
 func fetchSlice(esUrl, indexName, matchBody string, pageSize, sliceID, slices int,
-	dataChan chan<- interface{}, count *int64, totalFetchTime *int64) {
+	dataChan chan<- interface{}, count *int64, totalFetchTime *int64) error {
 
 	ss := GetEsScrollService(esUrl, indexName)
 	if matchBody != "" {
@@ -212,12 +220,12 @@ func fetchSlice(esUrl, indexName, matchBody string, pageSize, sliceID, slices in
 				// slices 倍の件数を取得してしまう。
 				n := atomic.AddInt64(count, 1)
 				if MaxDocs > 0 && n >= int64(MaxDocs) {
-					return
+					return nil
 				}
 			}
 			// 最終ページはヒット数が Size 未満になる。
 			if len(res.Hits.Hits) < pageSize {
-				return
+				return nil
 			}
 		}
 		// io.EOF は scroll を読み切ったことを示す正常終了の合図であり、
@@ -229,12 +237,50 @@ func fetchSlice(esUrl, indexName, matchBody string, pageSize, sliceID, slices in
 		// 同数になり、次の Do が 0 件 + io.EOF を返す。ここを異常終了として
 		// 扱うと、全件を読み終えているのにプロセスが落ちて出力が失われる。
 		if errors.Is(err, io.EOF) {
-			return
+			return nil
 		}
 		if err != nil {
-			log.Fatalln("ScrollService err", err)
+			// 一度もドキュメントが入っていないインデックスに sliced scroll を
+			// 投げると 400 になる。スライスの分割は既定で _id のフィールド
+			// データを使うが、空のセグメントには _id が存在せず OpenSearch が
+			// "field _id not found" を返す。空を読んだ結果が 0 件であることは
+			// 変わらないため、正常終了として扱う。
+			//
+			// ドキュメントを入れて全件削除した後のインデックスでは発生しない。
+			// セグメントに _id が残るためである。発生するのは新規作成して
+			// 一度も書き込んでいない場合だけである。
+			if isEmptyIndexSliceErr(err) {
+				log.Printf("slice %d: インデックス %s は空のため 0 件で終了する", sliceID, indexName)
+				return nil
+			}
+			return fmt.Errorf("ScrollService err (slice %d): %w", sliceID, err)
 		}
 	}
+}
+
+// isEmptyIndexSliceErr は空インデックスへの sliced scroll に固有の 400 か
+// どうかを判定する。
+//
+// 判定を "field _id not found" の有無まで絞る。search_phase_execution_exception
+// だけで判定すると、マッピングの不整合や不正なクエリなど本来落とすべき
+// エラーまで 0 件として飲み込み、取りこぼしに気づけなくなる。
+func isEmptyIndexSliceErr(err error) bool {
+	var esErr *elastic.Error
+	if !errors.As(err, &esErr) {
+		return false
+	}
+	if esErr.Status != http.StatusBadRequest || esErr.Details == nil {
+		return false
+	}
+	if esErr.Details.Type != "search_phase_execution_exception" {
+		return false
+	}
+	for _, rc := range esErr.Details.RootCause {
+		if rc != nil && strings.Contains(rc.Reason, "field _id not found") {
+			return true
+		}
+	}
+	return false
 }
 
 func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
@@ -282,12 +328,18 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	var count int64
 	var totalFetchTime int64 // ナノ秒。複数のスライスから加算する
 
+	// fetchErrs は各スライスのエラーを集める。1 本でも失敗したら export は
+	// 全件を出力できていない。ExportData の戻り値に反映して呼び出し側が
+	// 気づけるようにする。以前は log.Fatalln で即死していたため、失敗を
+	// 判別する手段が終了コードしかなく、書き出し中のデータも失われていた。
+	fetchErrs := make([]error, slices)
+
 	var wg sync.WaitGroup
 	for i := 0; i < slices; i++ {
 		wg.Add(1)
 		go func(sliceID int) {
 			defer wg.Done()
-			fetchSlice(esUrl, indexName, matchBody, pageSize, sliceID, slices, dataChan, &count, &totalFetchTime)
+			fetchErrs[sliceID] = fetchSlice(esUrl, indexName, matchBody, pageSize, sliceID, slices, dataChan, &count, &totalFetchTime)
 		}(i)
 	}
 
@@ -300,16 +352,32 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	storeTime :=0.0
 	bsCounter:=0
 	storeCount :=0
+	// writeErr は書き出し側のエラーである。err に直接入れず分けているのは、
+	// 最後に fetch 側のエラーと合わせて判定するためである。
+	var writeErr error
 	for  chanItem := range dataChan {
+		// 書き出しに失敗した後もチャネルは読み切る。
+		//
+		// ここで break すると受信側が消える。fetchSlice は dataChan への
+		// 送信でブロックしたまま止まり、wg.Wait() が返らないため close も
+		// 行われず、プロセスがハングする。バッファは 300 しかないため、
+		// 大きなインデックスでは確実にこの状態になる。
+		if writeErr != nil {
+			continue
+		}
 		storeCount +=1
 		hit:=chanItem.(elastic.SearchHit)
 		item:=hitItem{hit.Index, hit.Id, 1, hit.Source}
 		bs,_:=json.Marshal(&item)
-		_, err = outputWriter.Write(bs)
-		_, err = outputWriter.Write([]byte("\n"))
-		if err != nil {
-			log.Println("io err:",err)
-			break
+		if _, e := outputWriter.Write(bs); e != nil {
+			log.Println("io err:", e)
+			writeErr = e
+			continue
+		}
+		if _, e := outputWriter.Write([]byte("\n")); e != nil {
+			log.Println("io err:", e)
+			writeErr = e
+			continue
 		}
 		bsCounter+=len(bs)
 		// 0 は無効を意味する。剰余は 0 で panic するため必ず先に弾く。
@@ -318,6 +386,10 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 			storeTime =0
 		}
 	}
+
+	// fetch 側のエラーを集約する。書き出しは成功していても全件揃っていない
+	// ため、成功として返してはいけない。
+	err = errors.Join(append([]error{writeErr}, fetchErrs...)...)
 	if err != nil {
 		log.Print(err)
 	}
