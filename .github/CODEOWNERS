@@ -1,10 +1,28 @@
 # セキュリティ上重要なファイルの変更にレビューを要求する。
 # CI/CD 設定と依存関係定義は、侵害されるとビルド成果物そのものが
 # 差し替わるため、変更を見落とさないようにする。
+#
+# 構文が不正な行はエラーにならず黙ってスキップされる。保護している
+# つもりのファイルが無保護になるため、変更後は Settings > Code owners
+# でエラーが出ていないことを確認する。
+#
+# 末尾スラッシュはサブディレクトリまで再帰的に一致する。将来 workflow を
+# 入れ子にしてもパターンを変えずに保護対象に入る。
 /.github/workflows/  @hiboma
-/.github/dependabot.yml  @hiboma
-/.github/CODEOWNERS  @hiboma
+
+# リリース挙動を決めるファイルである。書き換えられると配布物が変わる。
+/.tagpr  @hiboma
 /.goreleaser.yml  @hiboma
+/.github/release.yml  @hiboma
+
+# 依存の固定と更新方針である。
 /go.mod  @hiboma
 /go.sum  @hiboma
+/.github/dependabot.yml  @hiboma
+
+# CI が実行するターゲットを含む。
+/Makefile  @hiboma
 /compose.yml  @hiboma
+
+# このファイル自身の書き換えで上記すべての保護を外せる。
+/.github/CODEOWNERS  @hiboma
