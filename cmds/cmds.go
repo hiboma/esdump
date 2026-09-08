@@ -112,8 +112,11 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 	}else{
 		inFile,err=os.Open(inputFile)
 	}
+	// オープン失敗はエラーとして返す。log.Fatalf は os.Exit を呼ぶため
+	// defer した inFile.Close() が実行されず、RunE がエラーを受け取る
+	// 経路も通らない。終了コードは 1 になるが、扱いが export 側と揃わない。
 	if err != nil {
-		log.Fatalf("open inputFile %s with err: %s",inputFile,err)
+		return fmt.Errorf("open inputFile %s: %w", inputFile, err)
 	}
 	defer inFile.Close()
 
@@ -121,10 +124,14 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 	if enableGzip{
 		zipReader,err1 := gzip.NewReader(inFile)
 		if err1 != nil {
+			// err1 を返す。名前付き戻り値の err はオープンが成功した時点で
+			// nil であり、これを返すと非 gzip ファイルを渡しても 0 件を
+			// import して正常終了する。export | import のパイプラインで
+			// 壊れたダンプと成功を区別できなくなる。
 			if errors.Is(err1,gzip.ErrHeader) {
-				log.Println("the input file is not gzipped format", err)
+				log.Println("the input file is not gzipped format", err1)
 			}
-			return err
+			return err1
 		}
 		sourceReader=zipReader
 		defer zipReader.Close()
@@ -314,9 +321,14 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	// 遅延実行のエラーは名前付き戻り値へ書き戻す。
 	//
 	// 4MB の bufio バッファと gzip の内部バッファに残ったデータは、最後の
-	// Flush と Close で初めてファイルへ届く。ENOSPC や -o - でのパイプ切断が
-	// ここで起きると、書き出し中は成功していたため戻り値が nil のまま
-	// 出力が壊れる。gzip のフッタ (CRC32 と ISIZE) も欠ける。
+	// Flush と Close で初めてファイルへ届く。ディスクが満杯 (ENOSPC) に
+	// なるとここで初めて失敗するため、書き出し中は成功していたことを理由に
+	// 戻り値が nil のままになり、gzip のフッタ (CRC32 と ISIZE) を欠いた
+	// 出力を成功として返す。
+	//
+	// なお -o - でのパイプ切断はここには来ない。Go の runtime は fd 1 と 2
+	// の SIGPIPE を EPIPE に変換せず再送するため、プロセスが signal で死ぬ。
+	// 読み手が消えている以上、拾っても回復できるものはない。
 	//
 	// 呼び出し側は成果物が使えないことに気づけないため、必ず拾う。
 	// 先に入ったエラーを優先する。原因に近いのは最初のエラーである。
@@ -325,6 +337,35 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 			err = e
 		}
 	}
+
+	// サマリは Flush と Close より先に defer へ積む。defer は LIFO なので、
+	// 最初に積んだこれが最後に走る。
+	//
+	// gzip のサイズは ofile.Stat() で読む。4MB の bufio バッファと gzip の
+	// 内部バッファは Flush と Close で初めてファイルへ届くため、それより
+	// 前に Stat するとバッファに残った分を数えず、実際のファイルより
+	// 小さい値を報告する。30 万件で 2.44 MB と 2.63 MB の差が出る。
+	//
+	// storeCount と bsCounter はクロージャが参照する。宣言はこの後だが、
+	// 実行時には確定している。
+	var storeCount, bsCounter int
+	storeTime := 0.0
+	defer func() {
+		// 標準出力ではサイズを報告しない。パイプや端末の Stat は
+		// 書き出したバイト数を返さない。
+		if !enableGzip || isStdout {
+			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
+			return
+		}
+		// ofile.Stat() ではなくパスで Stat する。ofile はこの時点で
+		// 閉じられており、file already closed になる。
+		stat, e := os.Stat(outputFile)
+		if e != nil {
+			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; gzip size の取得に失敗した: %s", storeCount, getMb(int64(bsCounter)), e)
+			return
+		}
+		log.Printf("total exported %d items; total_raw_bytes: %.2f MB;the gzip size: %.2f MB", storeCount, getMb(int64(bsCounter)), getMb(stat.Size()))
+	}()
 
 	// 標準出力は閉じない。閉じると後続の書き込みが失敗する。
 	if !isStdout {
@@ -382,9 +423,6 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 		log.Println("totalFetchTime", time.Duration(atomic.LoadInt64(&totalFetchTime)).Seconds(), "s")
 	}()
 
-	storeTime :=0.0
-	bsCounter:=0
-	storeCount :=0
 	// writeErr は書き出し側のエラーである。err に直接入れず分けているのは、
 	// 最後に fetch 側のエラーと合わせて判定するためである。
 	var writeErr error
@@ -425,13 +463,6 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	err = errors.Join(append([]error{writeErr}, fetchErrs...)...)
 	if err != nil {
 		log.Print(err)
-	}
-	if  enableGzip {
-		stat, _ := ofile.Stat()
-		fsize := getMb(stat.Size())
-		log.Printf("total exported %d items; total_raw_bytes: %.2f MB;the gzip size: %.2f MB", storeCount, getMb(int64(bsCounter)), fsize)
-	}else{
-		log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
 	}
 	return err
 }
