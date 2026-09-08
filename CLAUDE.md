@@ -33,8 +33,32 @@ make lint           # golangci-lint実行
 
 ### テスト実行
 ```bash
-go test             # 全テスト実行
-go test -v          # 詳細出力付きテスト実行
+make test/short        # ユニットテストのみ。OpenSearch 不要
+make test/integration  # OpenSearch を起動して全テストを実行する
+make test              # 全テスト。OpenSearch に繋がらなければ統合テストはスキップ
+make test/down         # コンテナを停止して削除する
+```
+
+統合テストは compose.yml の OpenSearch (127.0.0.1:19217) に接続します。
+sliced scroll の全件性とページ境界は実際の scroll API を叩かないと検証
+できないため、モックではなく実コンテナを使います。
+
+- ポートは 9200 を避けています。開発機の他の Elasticsearch / OpenSearch と
+  衝突させないためです
+- `ESDUMP_TEST_ES` で接続先を上書きできます
+- `ESDUMP_TEST_ES_REQUIRED=1` を立てると、繋がらない場合をスキップではなく
+  失敗として扱います。CI で統合テストが静かにスキップされ続けるのを防ぐため、
+  `.github/workflows/test.yml` はこれを立てています
+
+### 手動での性能検証
+
+統合テストの seed は数百件で、スループットの傾向を見るには足りません。
+大きなインデックスは `script/seed.sh` で作ります。
+
+```bash
+make test/seed COUNT=1000000 SHARDS=5
+./esdump export --es http://127.0.0.1:19217 --index esdump_bench \
+  --size 1000 --slices 5 -o /tmp/bench.json.gz
 ```
 
 ### クリーンアップ
@@ -74,13 +98,19 @@ make release-snapshot  # publish せずに dist/ へ成果物をビルドする
 
 ### プロジェクト構造
 ```
-main.go              # エントリーポイント
-main_test.go         # メインパッケージのテスト
-cmds/                # コマンド実装
-  ├── root.go        # cobRAルートコマンド定義
-  ├── cmds.go        # export/importコマンド実装
-  ├── es.go          # Elasticsearchクライアント
-  └── constant.go    # バージョン情報
+main.go                            # エントリーポイント
+main_test.go                       # ビルドとサブコマンド登録のテスト
+compose.yml                        # 統合テスト用の OpenSearch
+script/seed.sh                     # 手動検証用のインデックスを seed する
+cmds/                              # コマンド実装
+  ├── root.go                      # cobra ルートコマンド定義
+  ├── cmds.go                      # export/import コマンド実装
+  ├── es.go                        # Elasticsearch クライアント
+  ├── constant.go                  # バージョン情報
+  ├── unit_test.go                 # ES 不要のユニットテスト
+  ├── integration_helper_test.go   # seed と export 読み出しのヘルパ
+  ├── export_integration_test.go   # 全件性、ページ境界、MaxDocs、絞り込み
+  └── roundtrip_integration_test.go # export → import → 再 export の往復
 ```
 
 ### 主要コンポーネント
@@ -126,3 +156,39 @@ ssh server2 ./esdump import --es http://localhost:9200 --index tmp_index1 -i -
 - **TLS設定**: `InsecureSkipVerify: true`でTLS証明書検証を無効化
 - **並行処理**: データフェッチとファイル書き込みを別goroutineで実行
 - **エラーハンドリング**: バルクインポート時のエラーはログ出力のみで処理継続
+
+### export のエラー処理で守るべきこと
+
+以下は統合テストの追加時に発見して修正した問題です。同じ形の変更を
+入れると再発します。
+
+- **`fetchSlice` で `log.Fatal` を呼ばない**
+
+  `os.Exit` は `ExportData` の defer を実行しません。gzip writer の `Close` と
+  `bufio.Writer` の `Flush` が飛ぶため、それまでに取得したデータが失われ、
+  出力は途中で切れた不完全な gzip ストリームになります。数時間かけた export
+  の終盤で 1 度エラーが出ただけで成果物全体が使えなくなります。
+  エラーは戻り値で返し、`ExportData` が `errors.Join` で集約します。
+
+- **書き出しエラー後も `dataChan` は読み切る**
+
+  受信ループで `break` すると、`fetchSlice` が `dataChan` への送信で
+  ブロックしたまま止まります。`wg.Wait()` が返らず `close` も行われないため
+  プロセスがハングします。バッファは 300 しかないため、大きなインデックスでは
+  確実にこの状態になります。エラー後は書き出しをやめてチャネルだけを
+  読み進めます。
+
+- **空インデックスへの sliced scroll は 400 になる**
+
+  一度もドキュメントが入っていないインデックスに `--slices 2` 以上を
+  指定すると、OpenSearch が `field _id not found` の 400 を返します。
+  スライスの分割は既定で `_id` のフィールドデータを使いますが、空の
+  セグメントには `_id` が存在しないためです。0 件として正常終了させます。
+
+  ドキュメントを入れて全件削除した後のインデックスでは発生しません
+  (セグメントに `_id` が残るため)。`--MatchBody` で 0 件に絞った場合も
+  発生しません。発生するのは新規作成して一度も書き込んでいない場合だけです。
+
+  判定は `isEmptyIndexSliceErr` で `field _id not found` まで絞ります。
+  `search_phase_execution_exception` だけで判定すると、マッピングの不整合や
+  不正なクエリまで 0 件として飲み込み、取りこぼしに気づけなくなります。
