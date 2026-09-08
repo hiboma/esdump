@@ -48,7 +48,13 @@ sliced scroll の全件性とページ境界は実際の scroll API を叩かな
 - `ESDUMP_TEST_ES` で接続先を上書きできます
 - `ESDUMP_TEST_ES_REQUIRED=1` を立てると、繋がらない場合をスキップではなく
   失敗として扱います。CI で統合テストが静かにスキップされ続けるのを防ぐため、
-  `.github/workflows/test.yml` はこれを立てています
+  `.github/workflows/test.yml` はこれを立てています。ポートは繋がるが
+  クラスタが不健全 (起動途中、OOM 後の red) という状態も失敗にします。
+  service container はコンテナ起動と同時にポートを公開するため、この状態に
+  入りやすいためです
+- `ESDUMP_TEST_ES_REQUIRED` と `ESDUMP_TEST_ALLOW_REMOTE` はどちらも値 `1`
+  だけを受けます。空でないことを条件にすると `=0` が有効になり、無効化した
+  つもりの指定が有効として扱われます
 
 #### 接続先のガード
 
@@ -205,6 +211,20 @@ ssh server2 ./esdump import --es http://localhost:9200 --index tmp_index1 -i -
   `Flush` と `Close` で初めてファイルへ届きます。ENOSPC や `-o -` での
   パイプ切断がここで起きると、書き出し中は成功していたため戻り値が nil の
   まま出力が壊れます。gzip のフッタ (CRC32 と ISIZE) も欠けます。
+
+- **`ImportData` の gzip エラーは `err1` を返す**
+
+  名前付き戻り値の `err` はオープンが成功した時点で nil です。これを返すと
+  非 gzip ファイルを渡しても 0 件を import して正常終了します。
+  `export | import` のパイプラインで、壊れたダンプと成功を区別できません。
+
+- **サマリのログは Flush と Close より後に出す**
+
+  gzip のサイズは `os.Stat` で読みますが、バッファの内容は `Flush` と
+  `Close` で初めてファイルへ届きます。それより前に読むと実際のファイルより
+  小さい値を報告します。30 万件で 2.44 MB と 2.63 MB の差が出ました。
+  `defer` は LIFO なので、サマリは `Flush` と `Close` より**先に**積みます。
+  また `ofile.Stat()` は使えません。この時点で閉じられているためです。
 
 - **空インデックスへの sliced scroll は 400 になる**
 
