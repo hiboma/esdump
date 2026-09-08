@@ -131,6 +131,15 @@ releases: $(linux_releases) $(windows_releases)
 lint:
 	golangci-lint run --disable-all -E govet -E gofumpt -E megacheck ./...
 
+# サプライチェーン対策の検証をローカルで回す。CI の security.yml と同じ内容である。
+# 手元で先に気づけるようにするためで、CI 側のゲーティングは省略しない。
+.PHONY: lint/security
+lint/security:
+	actionlint
+	zizmor .github/workflows/
+	pinact run --check
+	govulncheck ./...
+
 clean:
 	rm $(BINDIR)/*
 # --- release (goreleaser) ---
