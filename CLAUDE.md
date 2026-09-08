@@ -29,6 +29,7 @@ make releases       # gzip/zip圧縮されたバイナリを生成
 ### リント
 ```bash
 make lint           # golangci-lint実行
+make lint/security  # actionlint, zizmor, pinact, govulncheck (CI と同じ内容)
 ```
 
 ### テスト実行
@@ -144,6 +145,108 @@ RID=$(gh run list --workflow=test.yml --branch=tagpr-from-vX.Y.Z --limit 1 --jso
 gh api -X POST "repos/hiboma/esdump/actions/runs/$RID/approve"
 ```
 
+## サプライチェーン対策
+
+ビルドとリリースの経路が侵害されると、利用者が受け取るバイナリそのものが
+差し替わります。以下は「固定する」と「固定したものを更新する」を必ず
+対で入れています。固定しただけでは古い脆弱なバージョンに留まるためです。
+
+### 固定しているもの
+
+| 対象 | 固定方法 | 更新経路 |
+|---|---|---|
+| GitHub Actions | SHA 固定 (タグはコメントで併記) | Dependabot (github-actions) |
+| OpenSearch イメージ | `@sha256:` ダイジェスト固定 | Dependabot (docker) |
+| Go の依存 | go.sum + `toolchain` | Dependabot (gomod) |
+| CI で入れるツール | バージョン固定 + `sha256sum -c` | 手動 (checksum を併記) |
+| goreleaser 本体 | `version:` に厳密な semver | 手動 |
+
+`goreleaser-action` の `version` は `~> v2` のような浮動範囲にしません。
+リリース成果物を作るバイナリ自体が実行時に決まると、他で徹底している
+固定が最後の一段で崩れます。action の SHA を固定しても、action が
+ダウンロードする goreleaser は別物である点に注意します。
+
+Dependabot はこの値を追えないため、更新は手動です。上げる際は公開から
+7 日以上経った版を選び、Dependabot の cooldown と基準を揃えます。
+ここだけ公開直後の版を掴むと、リリース経路が最も弱い一点になります。
+
+Dependabot には全エコシステムに `cooldown: 7` を設定しています。公開直後の
+バージョンを掴まないための待機期間です。CVE 対応のセキュリティ更新は
+cooldown の対象外なので、緊急パッチは遅延なく届きます。
+
+### go.mod の `toolchain` を消さないこと
+
+`setup-go` は `go-version-file: go.mod` で go.mod を読みます。`toolchain`
+行がないと `go 1.21` の記述に従って古い stdlib でビルドされ、修正済みの
+stdlib 脆弱性を含んだバイナリを配布します。実際に `toolchain` を入れる前は
+`govulncheck` が stdlib の脆弱性を 5 件報告していました。
+
+### CI でツールを入れるときは `curl | bash` を使わないこと
+
+配信元が侵害された場合に任意のコードが CI 上で実行されます。対策しようと
+している攻撃経路を、対策ツールの導入手順自体が作ることになります。
+バージョンを固定し、公式の checksums.txt と照合してから実行します。
+`security.yml` と `tagpr.yml` の Install ステップがその形です。
+
+### リリースジョブで `cache: true` にしないこと
+
+`tagpr.yml` の `setup-go` は `cache: false` です。PR のジョブが書き込んだ
+ビルドキャッシュをリリースジョブが復元すると、汚染された中間オブジェクトが
+公開バイナリに混入する経路ができます (cache poisoning)。リリースは
+年に数回であり、毎回クリーンにビルドする方が費用対効果が良いです。
+
+### `security.yml` の位置づけ
+
+`actionlint` と `zizmor` はワークフロー YAML の静的解析、`pinact run --check`
+は SHA 固定の検証、`govulncheck` は依存と stdlib の脆弱性検出です。
+`pinact` と `govulncheck` はローカル任意実行に格下げしません。SHA 固定は
+タグ書き換え型の侵害に対する主要な防御線であり、脆弱性 DB は時間とともに
+更新されるため、当該コードを触らない PR ではローカル実行だとすり抜けます。
+後者の理由から週次の `schedule` も設定しています。
+
+`zizmor` は `tagpr.yml` の checkout に `ignore[artipacked]` を 1 件だけ
+付けています。tagpr が git でタグとリリースブランチを push するため、
+`persist-credentials: false` にできません。このジョブは artifact を上げず
+外部から持ち込んだコードも実行しないため、トークンの持ち出し経路は
+ありません。他の checkout は `persist-credentials: false` です。
+
+### リリース資産の SBOM
+
+`.goreleaser.yml` の `sboms` が成果物ごとに SBOM を生成します。新たな
+脆弱性が公開された際に、どのリリースが影響を受けるかをリリース資産だけで
+特定できるようにするためです。生成には `syft` が必要で、`tagpr.yml` が
+バージョン固定 + checksum 照合で入れています。ローカルで
+`goreleaser release --snapshot` を試す場合も `syft` が必要です。
+
+### リポジトリ側の設定
+
+コードには現れないため、ここに記録します。
+
+- Dependabot alerts と security updates を有効化しています
+- Secret scanning と push protection を有効化しています (public リポジトリなので無償)
+- master に Repository Ruleset を設定しています。force push と削除を禁止し、
+  PR と `test` / `workflow-lint` / `vulncheck` の通過を必須にしています。
+  単独開発なので承認数は 0 です。repository admin を bypass に
+  入れているため、詰まった場合は迂回できます
+
+```bash
+gh api repos/hiboma/esdump/rulesets
+```
+
+### CODEOWNERS の注意点
+
+構文が不正な行はエラーにならず黙ってスキップされます。保護しているつもりの
+ファイルが無保護になるため、変更後は GitHub のパーサで検証します。
+
+```bash
+gh api "repos/hiboma/esdump/codeowners/errors?ref=<branch>"
+```
+
+`{"errors":[]}` なら全行が有効です。なお単独開発では CODEOWNERS から
+第二者レビューは生まれません (自分の PR は自分で承認できないため)。
+実効的な価値は機微なファイルの明示と、fork からの外部 PR に対する
+承認要求です。実際の防御は SHA 固定・checksum 照合・Dependabot が担います。
+
 ## アーキテクチャ
 
 ### プロジェクト構造
@@ -152,6 +255,9 @@ main.go                            # エントリーポイント
 main_test.go                       # ビルドとサブコマンド登録のテスト
 compose.yml                        # 統合テスト用の OpenSearch
 script/seed.sh                     # 手動検証用のインデックスを seed する
+.github/dependabot.yml             # 依存更新 (actions, gomod, docker) + cooldown
+.github/CODEOWNERS                 # CI 設定と依存定義の変更にレビューを要求
+.github/workflows/security.yml     # actionlint, zizmor, pinact, govulncheck
 cmds/                              # コマンド実装
   ├── root.go                      # cobra ルートコマンド定義
   ├── cmds.go                      # export/import コマンド実装

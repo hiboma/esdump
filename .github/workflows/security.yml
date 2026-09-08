@@ -1,0 +1,96 @@
+# サプライチェーン対策の検証である。
+#
+# ツールは curl | bash で入れない。配信元が侵害された場合に任意の
+# コードが実行され、この workflow が防ごうとしている攻撃経路を
+# 導入手順自体が作ってしまう。バージョンを固定し、公式の checksums.txt
+# と照合してから実行する。
+name: security
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  # 脆弱性 DB は時間とともに更新される。PR 契機だけだと、脆弱性が
+  # 公開されても当該コードを触らない限り気づけない。週次で回す。
+  schedule:
+    - cron: "17 2 * * 1"
+
+permissions: {}
+
+jobs:
+  # ワークフロー YAML の静的解析である。
+  workflow-lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz" -o actionlint.tar.gz
+          echo "${SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar xf actionlint.tar.gz actionlint
+
+      - name: Install zizmor
+        env:
+          VERSION: 1.30.0
+          SHA256: ec8c95cd800845abb9bbc5f377ec7c57d2eb8e2386a00a201d3a74ee4092e5ed
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/zizmorcore/zizmor/releases/download/v${VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz" -o zizmor.tar.gz
+          echo "${SHA256}  zizmor.tar.gz" | sha256sum -c -
+          tar xf zizmor.tar.gz zizmor
+
+      - name: Install pinact
+        env:
+          VERSION: 4.1.1
+          SHA256: d1cffebe5704b74e2e5f8a864efb9f7e54768972dc686188c008033fb1797841
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/suzuki-shunsuke/pinact/releases/download/v${VERSION}/pinact_linux_amd64.tar.gz" -o pinact.tar.gz
+          echo "${SHA256}  pinact.tar.gz" | sha256sum -c -
+          tar xf pinact.tar.gz pinact
+
+      - name: actionlint
+        run: ./actionlint
+
+      - name: zizmor
+        run: ./zizmor .github/workflows/
+
+      # アクション参照が SHA で固定されたままかを検証する。
+      # tj-actions/changed-files 型の侵害 (タグの書き換え) に対する
+      # 主要な防御線であり、ローカル任意実行に格下げしない。
+      - name: pinact (SHA 固定の検証)
+        run: ./pinact run --check
+
+  # 依存関係と Go stdlib の既知脆弱性を検出する。
+  vulncheck:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # govulncheck は呼び出しグラフを見るため、到達しない脆弱性で
+      # 落ちない。go.mod の toolchain が古い stdlib を指していると
+      # ここで検出される。
+      - name: govulncheck
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...

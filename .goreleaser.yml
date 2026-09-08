@@ -32,6 +32,13 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# 成果物ごとに SBOM を生成する。新たな脆弱性が公開された際に、
+# どのリリースが影響を受けるかをリリース資産だけで特定できるようにする。
+# syft は goreleaser が呼び出す。
+sboms:
+  - id: archive
+    artifacts: archive
+
 changelog:
   use: github
   sort: asc

@@ -1,0 +1,33 @@
+# 依存関係の自動更新である。
+#
+# cooldown は公開直後のバージョンを掴まないための待機期間である。
+# 過去の主要インシデントは大半が公開から 1 週間以内に検出・削除されて
+# おり、7 日待つだけで悪性バージョンを掴む確率が大きく下がる。
+# CVE 対応のセキュリティ更新は cooldown の対象外であり、緊急パッチは
+# 遅延なく届く。
+version: 2
+updates:
+  # GitHub Actions は SHA 固定しているため、更新は Dependabot に任せる。
+  # 固定しただけでは古い SHA に留まりセキュリティパッチを取り逃す。
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  # compose.yml のダイジェスト固定を追従させる。固定しただけでは
+  # 脆弱性が修正された新しいイメージに上がらない。
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
