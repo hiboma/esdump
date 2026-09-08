@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.0.4](https://github.com/hiboma/esdump/compare/v0.0.3...v0.0.4) - 2026-09-08
+
+- サプライチェーン対策: ビルドとリリース経路の hardening by @hiboma in https://github.com/hiboma/esdump/pull/13
+
 ## [v0.0.3](https://github.com/hiboma/esdump/compare/v0.0.2...v0.0.3) - 2026-09-08
 
 - Test export against a real OpenSearch, and fix the four bugs it found by @hiboma in https://github.com/hiboma/esdump/pull/11
