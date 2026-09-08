@@ -1,0 +1,10 @@
+# セキュリティ上重要なファイルの変更にレビューを要求する。
+# CI/CD 設定と依存関係定義は、侵害されるとビルド成果物そのものが
+# 差し替わるため、変更を見落とさないようにする。
+/.github/workflows/  @hiboma
+/.github/dependabot.yml  @hiboma
+/.github/CODEOWNERS  @hiboma
+/.goreleaser.yml  @hiboma
+/go.mod  @hiboma
+/go.sum  @hiboma
+/compose.yml  @hiboma
