@@ -19,6 +19,23 @@ SHARDS="${2:-3}"
 # http.max_content_length (既定 100mb) に当たる。
 BATCH="${BATCH:-5000}"
 
+# 数値であることを確認する。COUNT と SHARDS は JSON の値位置と算術式に
+# 入るため、非数値だと意図しない設定キーの注入や、投入ループの空回りに
+# なる。手元専用のスクリプトだが、書き間違いを早い段階で明確に落とす。
+for var in COUNT SHARDS BATCH; do
+  val="${!var}"
+  case "${val}" in
+    '' | *[!0-9]*)
+      echo "${var} は正の整数である必要がある: ${val}" >&2
+      exit 1
+      ;;
+  esac
+  if [ "${val}" -lt 1 ] && [ "${var}" != "COUNT" ]; then
+    echo "${var} は 1 以上である必要がある: ${val}" >&2
+    exit 1
+  fi
+done
+
 echo "es=${ES} index=${INDEX} count=${COUNT} shards=${SHARDS}"
 
 curl -sf -X DELETE "${ES}/${INDEX}" >/dev/null 2>&1 || true

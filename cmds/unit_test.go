@@ -2,6 +2,8 @@ package cmds
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,6 +171,38 @@ func Test_isEmptyIndexSliceErr(t *testing.T) {
 			want: false,
 		},
 		{
+			// 400 だが例外型が違う。ステータスだけで判定していないことを
+			// 固定する。
+			name: "400 で別の例外型",
+			err:  newElasticErr(400, "parsing_exception", "field _id not found"),
+			want: false,
+		},
+		{
+			// Details が nil のレスポンスもある。参照する前に弾く必要が
+			// ある。
+			name: "Details が nil",
+			err:  &elastic.Error{Status: 400},
+			want: false,
+		},
+		{
+			// RootCause が空でも Reason を走査して落ちてはいけない。
+			name: "RootCause が空",
+			err: &elastic.Error{
+				Status: 400,
+				Details: &elastic.ErrorDetails{
+					Type:   "search_phase_execution_exception",
+					Reason: "all shards failed",
+				},
+			},
+			want: false,
+		},
+		{
+			// elastic.Error 以外のエラーは飲み込まない。
+			name: "elastic.Error ではない",
+			err:  errors.New("field _id not found"),
+			want: false,
+		},
+		{
 			// ステータスが 400 でなければ別の問題である。
 			name: "500 で同じ理由",
 			err:  newElasticErr(500, "search_phase_execution_exception", "field _id not found"),
@@ -200,5 +234,68 @@ func newElasticErr(status int, typ, reason string) error {
 				{Type: typ, Reason: reason},
 			},
 		},
+	}
+}
+
+// Test_assertLocalTestEndpoint はテストの接続先ガードを確認する。
+//
+// このガードは統合テストが本番のインデックスを削除する事故を防ぐ。
+// seedIndex は DeleteIndex を呼ぶが、これは復旧不能な操作である。
+// ESDUMP_TEST_ES に本番のエンドポイントが入ったまま go test を打つと
+// そのクラスタのインデックスが消える。
+//
+// health チェックはガードにならない。到達できる場合に通すため、本番
+// クラスタほど確実に通過してしまう。ホスト名で判定する必要がある。
+//
+// ガード自体が壊れると事故を防げなくなるため、テストで固定する。
+func Test_assertLocalTestEndpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		esUrl       string
+		allowRemote string
+		// wantFatal はテストが停止されることを期待するかである。
+		wantFatal bool
+	}{
+		{name: "127.0.0.1", esUrl: "http://127.0.0.1:19217", wantFatal: false},
+		{name: "localhost", esUrl: "http://localhost:19217", wantFatal: false},
+		{name: "IPv6 ループバック", esUrl: "http://[::1]:19217", wantFatal: false},
+		// ローカル以外は既定で弾く。
+		{name: "本番風のホスト名", esUrl: "https://prod-es.internal:9200", wantFatal: true},
+		{name: "IP アドレス直指定", esUrl: "http://10.0.0.5:9200", wantFatal: true},
+		// 127.0.0.1 を含むが別のホストである文字列を通してはいけない。
+		{name: "ホスト名に 127.0.0.1 を含む", esUrl: "http://127.0.0.1.example.com:9200", wantFatal: true},
+		{name: "localhost を含むサブドメイン", esUrl: "http://localhost.example.com:9200", wantFatal: true},
+		// 明示的な opt-in があれば通す。事故と意図を区別する。
+		{name: "opt-in でローカル以外を許可", esUrl: "https://staging-es.internal:9200", allowRemote: "1", wantFatal: false},
+		// 1 以外の値では通さない。true や yes を通すと、値の書き間違いが
+		// 意図した opt-in として扱われる。
+		{name: "opt-in の値が 1 以外", esUrl: "https://prod-es.internal:9200", allowRemote: "true", wantFatal: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ESDUMP_TEST_ALLOW_REMOTE", tt.allowRemote)
+
+			if got := checkLocalTestEndpoint(tt.esUrl); (got != nil) != tt.wantFatal {
+				t.Errorf("checkLocalTestEndpoint(%q) = %v, wantFatal %v", tt.esUrl, got, tt.wantFatal)
+			}
+		})
+	}
+}
+
+// Test_testIndexPrefix は seedIndex がインデックス名の接頭辞を強制する
+// ことを確認する。
+//
+// 接頭辞は接続先を間違えた場合の被害範囲を限定する。ガードが 1 段だけだと
+// それが壊れたときに何も残らない。
+func Test_testIndexPrefix(t *testing.T) {
+	if !strings.HasPrefix("esdump_test_foo", testIndexPrefix) {
+		t.Errorf("testIndexPrefix が %q になっている", testIndexPrefix)
+	}
+	// テストが使うインデックス名は必ずこの接頭辞で始まる。接頭辞を
+	// 変えると seedIndex が全テストで停止するため、値を固定する。
+	if testIndexPrefix != "esdump_test_" {
+		t.Errorf("testIndexPrefix が変わった: %q", testIndexPrefix)
 	}
 }

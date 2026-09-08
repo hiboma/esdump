@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,11 +32,72 @@ func testEsUrl() string {
 	return defaultTestEsUrl
 }
 
+// testIndexPrefix は統合テストが作るインデックス名の接頭辞である。
+//
+// seedIndex はこの接頭辞を強制する。向け先を間違えた場合でも、削除される
+// 範囲をテスト専用の名前空間に閉じ込めるためである。
+const testIndexPrefix = "esdump_test_"
+
+// localTestHosts は seedIndex の削除を無条件に許すホストである。
+var localTestHosts = map[string]bool{
+	"127.0.0.1": true,
+	"localhost": true,
+	"::1":       true,
+}
+
+// assertLocalTestEndpoint は接続先がローカルであることを確認する。
+//
+// 統合テストは seedIndex で DeleteIndex を実行する。これは復旧不能な操作で
+// あり、スナップショットがなければ元に戻せない。
+//
+// ESDUMP_TEST_ES に本番やステージングのエンドポイントが入ったまま
+// go test を打つと、そのクラスタのインデックスが消える。go test は最も
+// 気軽に、確認なしで実行されるコマンドである。
+//
+// health チェックはガードにならない。到達できる場合に通すため、本番
+// クラスタほど確実に通過する。ホスト名で判定する必要がある。
+//
+// ローカル以外を意図して使う場合は ESDUMP_TEST_ALLOW_REMOTE=1 を渡す。
+// 明示的な opt-in を要求し、事故と意図を区別する。
+func assertLocalTestEndpoint(t *testing.T, esUrl string) {
+	t.Helper()
+	if err := checkLocalTestEndpoint(esUrl); err != nil {
+		t.Fatalf("%s", err)
+	}
+}
+
+// checkLocalTestEndpoint は接続先がローカルかどうかを判定する。
+//
+// assertLocalTestEndpoint から t.Fatalf する部分を分けている。ガード自体が
+// 壊れると事故を防げなくなるため、判定をテストできる形にしておく。
+//
+// ホスト名の完全一致で判定する。文字列の部分一致にすると
+// 127.0.0.1.example.com のような別のホストを通してしまう。
+func checkLocalTestEndpoint(esUrl string) error {
+	u, err := url.Parse(esUrl)
+	if err != nil {
+		return fmt.Errorf("接続先 URL を解析できない (%s): %w", esUrl, err)
+	}
+	if localTestHosts[u.Hostname()] {
+		return nil
+	}
+	// 値は 1 だけを受ける。true や yes を通すと、書き間違いが意図した
+	// opt-in として扱われる。
+	if os.Getenv("ESDUMP_TEST_ALLOW_REMOTE") == "1" {
+		return nil
+	}
+	return fmt.Errorf("統合テストはインデックスを削除する。ローカル以外 (%s) を対象にするには "+
+		"ESDUMP_TEST_ALLOW_REMOTE=1 が必要である", esUrl)
+}
+
 // requireEs は OpenSearch に到達できなければテストをスキップする。
 //
 // -short でのスキップと、コンテナ未起動でのスキップを分けている。
 // 前者は意図的な省略、後者は環境の不足である。CI で後者を失敗させたい
 // 場合は ESDUMP_TEST_ES_REQUIRED=1 を渡す。
+//
+// 接続先の検証は到達確認より先に行う。ローカル以外を弾くのが目的であり、
+// 到達できたかどうかとは無関係に判定しなければならない。
 func requireEs(t *testing.T) string {
 	t.Helper()
 	if testing.Short() {
@@ -42,6 +105,8 @@ func requireEs(t *testing.T) string {
 	}
 
 	url := testEsUrl()
+	assertLocalTestEndpoint(t, url)
+
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(url + "/_cluster/health")
 	if err != nil {
@@ -77,6 +142,17 @@ type seedDoc struct {
 // シャード数を決められるようにしている。
 func seedIndex(t *testing.T, esUrl, indexName string, count, shards int) {
 	t.Helper()
+
+	// 削除する前に接続先とインデックス名を検証する。DeleteIndex は復旧
+	// 不能であり、呼ぶ前に弾く以外に安全策はない。
+	//
+	// requireEs でも接続先を検証しているが、ここでも行う。seedIndex を
+	// requireEs を通さずに呼ぶテストが追加されても、削除の直前で止まる。
+	assertLocalTestEndpoint(t, esUrl)
+	if !strings.HasPrefix(indexName, testIndexPrefix) {
+		t.Fatalf("テスト用インデックス名は %q で始める必要がある: %s", testIndexPrefix, indexName)
+	}
+
 	ctx := context.Background()
 	client := getEsClient(esUrl)
 
