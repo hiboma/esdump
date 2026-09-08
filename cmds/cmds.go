@@ -299,6 +299,54 @@ func isEmptyIndexSliceErr(err error) bool {
 	return false
 }
 
+// newOutputWriter は出力先とその確定処理を組み立てる。
+//
+// 返す finish は、積んだ Flush と Close を上流から下流の順に呼び、最初の
+// エラーを返す。呼び出し側は必ず戻り値を確認すること。
+//
+// bufio と gzip はバッファに溜めるため、最後の Flush と Close で初めて
+// 書き込まれる分がある。gzip は Close で残りをフラッシュして終端を書く。
+// ここで戻り値を捨てると、末尾の欠けたファイルが exit 0 で残る。
+//
+// 以前は defer で Flush と Close を並べ、戻り値を全て捨てていた。バッファ
+// (4MB) に収まる量ならループ内で一度も書き込まれないため、書き込み先が
+// 容量不足でも err は nil のままだった。呼び出し側は成功と判断していた。
+//
+// sink は書き込み先である。テストから任意の writer を渡せるよう *os.File
+// ではなくインターフェースで受ける。closeSink が nil なら書き込み先は
+// 閉じない (標準出力の場合)。
+func newOutputWriter(sink io.Writer, closeSink func() error, useGzip bool) (*bufio.Writer, func() error) {
+	targetWriter := sink
+	var closers []func() error
+
+	if useGzip {
+		zip := gzip.NewWriter(sink)
+		targetWriter = zip
+		closers = append(closers, zip.Close)
+	}
+
+	outputWriter := bufio.NewWriterSize(targetWriter, 1<<22)
+	// bufio を先に流す。gzip より後にすると、まだ渡していないバイトを捨てる。
+	closers = append([]func() error{outputWriter.Flush}, closers...)
+
+	if closeSink != nil {
+		closers = append(closers, closeSink)
+	}
+
+	finish := func() error {
+		var firstErr error
+		for _, closeFn := range closers {
+			// 途中で失敗しても残りを呼ぶ。ファイルディスクリプタを
+			// 漏らさないためである。
+			if cerr := closeFn(); cerr != nil && firstErr == nil {
+				firstErr = cerr
+			}
+		}
+		return firstErr
+	}
+	return outputWriter, finish
+}
+
 func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	var ofile *os.File
 	isStdout := outputFile == "-"
@@ -311,54 +359,44 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 		ofile, err= os.OpenFile(outputFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	}
 
-	// オープンの成否を先に見る。失敗時は ofile が nil であり、defer に
-	// Close を積む前に返さなければ nil ポインタを参照する。
+	// オープンの成否を先に見る。失敗時は ofile が nil であり、確定処理を
+	// 組み立てる前に返さなければ nil ポインタを参照する。
 	if err != nil {
 		log.Print("open file err", err)
 		return err
 	}
 
-	// 遅延実行のエラーは名前付き戻り値へ書き戻す。
-	//
-	// 4MB の bufio バッファと gzip の内部バッファに残ったデータは、最後の
-	// Flush と Close で初めてファイルへ届く。ディスクが満杯 (ENOSPC) に
-	// なるとここで初めて失敗するため、書き出し中は成功していたことを理由に
-	// 戻り値が nil のままになり、gzip のフッタ (CRC32 と ISIZE) を欠いた
-	// 出力を成功として返す。
-	//
-	// なお -o - でのパイプ切断はここには来ない。Go の runtime は fd 1 と 2
-	// の SIGPIPE を EPIPE に変換せず再送するため、プロセスが signal で死ぬ。
-	// 読み手が消えている以上、拾っても回復できるものはない。
-	//
-	// 呼び出し側は成果物が使えないことに気づけないため、必ず拾う。
-	// 先に入ったエラーを優先する。原因に近いのは最初のエラーである。
-	keepErr := func(e error) {
-		if e != nil && err == nil {
-			err = e
-		}
-	}
-
-	// サマリは Flush と Close より先に defer へ積む。defer は LIFO なので、
+	// サマリは確定処理より先に defer へ積む。defer は LIFO なので、
 	// 最初に積んだこれが最後に走る。
 	//
-	// gzip のサイズは ofile.Stat() で読む。4MB の bufio バッファと gzip の
-	// 内部バッファは Flush と Close で初めてファイルへ届くため、それより
-	// 前に Stat するとバッファに残った分を数えず、実際のファイルより
+	// gzip のサイズはパスで Stat して読む。4MB の bufio バッファと gzip の
+	// 内部バッファは finish() の Flush と Close で初めてファイルへ届くため、
+	// それより前に読むとバッファに残った分を数えず、実際のファイルより
 	// 小さい値を報告する。30 万件で 2.44 MB と 2.63 MB の差が出る。
 	//
-	// storeCount と bsCounter はクロージャが参照する。宣言はこの後だが、
-	// 実行時には確定している。
+	// ofile.Stat() は使えない。この時点で閉じられており file already closed
+	// になる。
+	//
+	// storeCount、bsCounter、storeStart はクロージャが参照する。宣言は
+	// この後だが、実行時には確定している。
+	//
+	// storeStart は最後に進捗ログを出した時刻である。ゼロ値のままサマリを
+	// 出すと 1970 年からの経過秒になるため、受信ループの直前で初期化する。
 	var storeCount, bsCounter int
-	storeTime := 0.0
+	var storeStart time.Time
 	defer func() {
+		// storeStart がゼロ値なら受信ループに入る前に抜けている。
+		// 計測していない値を出さない。
+		storeTime := 0.0
+		if !storeStart.IsZero() {
+			storeTime = time.Since(storeStart).Seconds()
+		}
 		// 標準出力ではサイズを報告しない。パイプや端末の Stat は
 		// 書き出したバイト数を返さない。
 		if !enableGzip || isStdout {
 			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
 			return
 		}
-		// ofile.Stat() ではなくパスで Stat する。ofile はこの時点で
-		// 閉じられており、file already closed になる。
 		stat, e := os.Stat(outputFile)
 		if e != nil {
 			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; gzip size の取得に失敗した: %s", storeCount, getMb(int64(bsCounter)), e)
@@ -367,24 +405,23 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 		log.Printf("total exported %d items; total_raw_bytes: %.2f MB;the gzip size: %.2f MB", storeCount, getMb(int64(bsCounter)), getMb(stat.Size()))
 	}()
 
-	// 標準出力は閉じない。閉じると後続の書き込みが失敗する。
+	// 標準出力は閉じない。以降のログ出力を妨げる。
+	var closeSink func() error
 	if !isStdout {
-		defer func() { keepErr(ofile.Close()) }()
+		closeSink = ofile.Close
 	}
+	outputWriter, finish := newOutputWriter(ofile, closeSink, enableGzip)
 
-	var targetWriter io.Writer
-	if enableGzip{
-		zip := gzip.NewWriter(ofile)
-		// gzip の Close はフッタを書く。Flush だけでは gzip ストリームが
-		// 完成しない。defer は LIFO で、bufio の Flush より後に走る。
-		defer func() { keepErr(zip.Close()) }()
-		targetWriter=zip
-	}else{
-		targetWriter=ofile
-	}
+	// 書き込みの確定でエラーを捨てない。
+	//
+	// 名前付き戻り値の err に集約する。既にエラーがあればそれを優先し、
+	// 上書きしない。最初の失敗こそが原因に近い。
+	defer func() {
+		if cerr := finish(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
-	outputWriter:=bufio.NewWriterSize(targetWriter,1<<22)
-	defer func() { keepErr(outputWriter.Flush()) }()
 	pageSize := PageSize
 	if pageSize <= 0 {
 		pageSize = 100
@@ -426,6 +463,20 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	// writeErr は書き出し側のエラーである。err に直接入れず分けているのは、
 	// 最後に fetch 側のエラーと合わせて判定するためである。
 	var writeErr error
+
+	// storeTime は出力側 (JSON 化と書き込み) にかけた時間である。
+	//
+	// 以前は 0 で初期化してログに出すだけで、測定値を代入していなかった。
+	// ログの storeTime は常に 0.000000 だった。取得待ち (totalFetchTime) と
+	// 突き合わせて、どちらがボトルネックかを判断するための値なので、
+	// 測っていなければ意味がない。
+	//
+	// 区間の始点だけを持ち、ログを出すたびに測り直す。毎件 time.Now() を
+	// 呼ぶと実測で 7.2% 遅くなった。計測のために遅くするのは本末転倒である。
+	// チャネル待ちを含む値になるが、出力側が詰まっているかを見るには足りる。
+	//
+	// 変数はサマリの defer が参照するため上で宣言している。ここで代入する。
+	storeStart = time.Now()
 	for  chanItem := range dataChan {
 		// 書き出しに失敗した後もチャネルは読み切る。
 		//
@@ -439,22 +490,34 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 		storeCount +=1
 		hit:=chanItem.(elastic.SearchHit)
 		item:=hitItem{hit.Index, hit.Id, 1, hit.Source}
-		bs,_:=json.Marshal(&item)
-		if _, e := outputWriter.Write(bs); e != nil {
-			log.Println("io err:", e)
-			writeErr = e
+		// Marshal のエラーを捨てない。捨てると空の bs が書かれ、
+		// 壊れた行が出力に混ざったまま正常終了する。
+		//
+		// break ではなく writeErr へ入れて読み続ける。break すると
+		// fetchSlice が dataChan への送信でブロックし、プロセスがハングする。
+		bs,merr:=json.Marshal(&item)
+		if merr != nil {
+			writeErr = fmt.Errorf("json marshal err (index=%s id=%s): %w", hit.Index, hit.Id, merr)
+			log.Println(writeErr)
 			continue
 		}
-		if _, e := outputWriter.Write([]byte("\n")); e != nil {
-			log.Println("io err:", e)
-			writeErr = e
+		// 1 本目の戻り値を 2 本目で上書きしない。bufio はエラーを保持する
+		// ため実害は出にくいが、どちらで失敗したか分からなくなる。
+		if _, werr := outputWriter.Write(bs); werr != nil {
+			log.Println("io err:", werr)
+			writeErr = werr
+			continue
+		}
+		if werr := outputWriter.WriteByte('\n'); werr != nil {
+			log.Println("io err:", werr)
+			writeErr = werr
 			continue
 		}
 		bsCounter+=len(bs)
 		// 0 は無効を意味する。剰余は 0 で panic するため必ず先に弾く。
 		if ProgressEvery > 0 && storeCount%ProgressEvery==0{
-			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
-			storeTime =0
+			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), time.Since(storeStart).Seconds())
+			storeStart = time.Now()
 		}
 	}
 
