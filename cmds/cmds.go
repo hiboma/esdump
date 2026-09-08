@@ -6,24 +6,36 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/olivere/elastic/v7"
 	"github.com/spf13/cobra"
 	"io"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+// Run ではなく RunE を使う。cobra は Run の戻り値を持たないため、
+// エラーが呼び出し側に伝わらず終了コードが 0 のままになる。
+//
+// export が一部のスライスで失敗して全件揃っていない場合に成功と区別できない
+// と、シェルや cron、CI から見て取りこぼしに気づけない。Execute() は
+// エラーを受けて os.Exit(1) する。
 var exportCmd = &cobra.Command{
 	Use:   "export",
 	Short: "elasticsearch export",
 	Long:  `elasticsearch export`,
-	Run: func(cmd *cobra.Command, args []string) {
+	// エラーは Execute() が 1 度出力するため、cobra 側の重複出力を止める。
+	// usage も出さない。引数の誤りではなく実行時の失敗である。
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		log.Printf("export index %s to %s",IndexName,Output)
-		ExportData(Output,EsUrl,IndexName,MatchBody)
+		return ExportData(Output,EsUrl,IndexName,MatchBody)
 	},
 }
 
@@ -31,12 +43,11 @@ var importCmd = &cobra.Command{
 	Use:   "import",
 	Short: "elasticsearch import",
 	Long:  `elasticsearch import`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		log.Printf("import index %s from %s",IndexName,Input)
-		err:=ImportData(Input,EsUrl,IndexName)
-		if err != nil {
-			log.Println(err)
-		}
+		return ImportData(Input,EsUrl,IndexName)
 	},
 }
 var Output string
@@ -101,8 +112,11 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 	}else{
 		inFile,err=os.Open(inputFile)
 	}
+	// オープン失敗はエラーとして返す。log.Fatalf は os.Exit を呼ぶため
+	// defer した inFile.Close() が実行されず、RunE がエラーを受け取る
+	// 経路も通らない。終了コードは 1 になるが、扱いが export 側と揃わない。
 	if err != nil {
-		log.Fatalf("open inputFile %s with err: %s",inputFile,err)
+		return fmt.Errorf("open inputFile %s: %w", inputFile, err)
 	}
 	defer inFile.Close()
 
@@ -110,10 +124,14 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 	if enableGzip{
 		zipReader,err1 := gzip.NewReader(inFile)
 		if err1 != nil {
+			// err1 を返す。名前付き戻り値の err はオープンが成功した時点で
+			// nil であり、これを返すと非 gzip ファイルを渡しても 0 件を
+			// import して正常終了する。export | import のパイプラインで
+			// 壊れたダンプと成功を区別できなくなる。
 			if errors.Is(err1,gzip.ErrHeader) {
-				log.Println("the input file is not gzipped format", err)
+				log.Println("the input file is not gzipped format", err1)
 			}
-			return err
+			return err1
 		}
 		sourceReader=zipReader
 		defer zipReader.Close()
@@ -170,8 +188,14 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 // 逐次である。並行化はスライスを分ける以外に方法がない。
 //
 // count と totalFetchTime は全スライスで共有する。atomic で更新すること。
+//
+// エラーは戻り値で返す。以前はここで log.Fatalln していたが、os.Exit は
+// ExportData の defer を実行しない。gzip writer の Close とバッファの Flush が
+// 飛ぶため、それまでに取得したデータが失われ、出力ファイルは途中で切れた
+// 不完全な gzip ストリームになる。数時間かけた export の終盤で 1 度エラーが
+// 出ただけで成果物全体が使えなくなる。
 func fetchSlice(esUrl, indexName, matchBody string, pageSize, sliceID, slices int,
-	dataChan chan<- interface{}, count *int64, totalFetchTime *int64) {
+	dataChan chan<- interface{}, count *int64, totalFetchTime *int64) error {
 
 	ss := GetEsScrollService(esUrl, indexName)
 	if matchBody != "" {
@@ -212,12 +236,12 @@ func fetchSlice(esUrl, indexName, matchBody string, pageSize, sliceID, slices in
 				// slices 倍の件数を取得してしまう。
 				n := atomic.AddInt64(count, 1)
 				if MaxDocs > 0 && n >= int64(MaxDocs) {
-					return
+					return nil
 				}
 			}
 			// 最終ページはヒット数が Size 未満になる。
 			if len(res.Hits.Hits) < pageSize {
-				return
+				return nil
 			}
 		}
 		// io.EOF は scroll を読み切ったことを示す正常終了の合図であり、
@@ -229,17 +253,56 @@ func fetchSlice(esUrl, indexName, matchBody string, pageSize, sliceID, slices in
 		// 同数になり、次の Do が 0 件 + io.EOF を返す。ここを異常終了として
 		// 扱うと、全件を読み終えているのにプロセスが落ちて出力が失われる。
 		if errors.Is(err, io.EOF) {
-			return
+			return nil
 		}
 		if err != nil {
-			log.Fatalln("ScrollService err", err)
+			// 一度もドキュメントが入っていないインデックスに sliced scroll を
+			// 投げると 400 になる。スライスの分割は既定で _id のフィールド
+			// データを使うが、空のセグメントには _id が存在せず OpenSearch が
+			// "field _id not found" を返す。空を読んだ結果が 0 件であることは
+			// 変わらないため、正常終了として扱う。
+			//
+			// ドキュメントを入れて全件削除した後のインデックスでは発生しない。
+			// セグメントに _id が残るためである。発生するのは新規作成して
+			// 一度も書き込んでいない場合だけである。
+			if isEmptyIndexSliceErr(err) {
+				log.Printf("slice %d: インデックス %s は空のため 0 件で終了する", sliceID, indexName)
+				return nil
+			}
+			return fmt.Errorf("ScrollService err (slice %d): %w", sliceID, err)
 		}
 	}
 }
 
+// isEmptyIndexSliceErr は空インデックスへの sliced scroll に固有の 400 か
+// どうかを判定する。
+//
+// 判定を "field _id not found" の有無まで絞る。search_phase_execution_exception
+// だけで判定すると、マッピングの不整合や不正なクエリなど本来落とすべき
+// エラーまで 0 件として飲み込み、取りこぼしに気づけなくなる。
+func isEmptyIndexSliceErr(err error) bool {
+	var esErr *elastic.Error
+	if !errors.As(err, &esErr) {
+		return false
+	}
+	if esErr.Status != http.StatusBadRequest || esErr.Details == nil {
+		return false
+	}
+	if esErr.Details.Type != "search_phase_execution_exception" {
+		return false
+	}
+	for _, rc := range esErr.Details.RootCause {
+		if rc != nil && strings.Contains(rc.Reason, "field _id not found") {
+			return true
+		}
+	}
+	return false
+}
+
 func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	var ofile *os.File
-	if outputFile=="-"{
+	isStdout := outputFile == "-"
+	if isStdout{
 		ofile=os.Stdout
 	}else{
 		if enableGzip && !strings.HasSuffix(outputFile,".gz"){
@@ -247,24 +310,81 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 		}
 		ofile, err= os.OpenFile(outputFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	}
-	defer ofile.Close()
 
+	// オープンの成否を先に見る。失敗時は ofile が nil であり、defer に
+	// Close を積む前に返さなければ nil ポインタを参照する。
 	if err != nil {
 		log.Print("open file err", err)
 		return err
 	}
+
+	// 遅延実行のエラーは名前付き戻り値へ書き戻す。
+	//
+	// 4MB の bufio バッファと gzip の内部バッファに残ったデータは、最後の
+	// Flush と Close で初めてファイルへ届く。ディスクが満杯 (ENOSPC) に
+	// なるとここで初めて失敗するため、書き出し中は成功していたことを理由に
+	// 戻り値が nil のままになり、gzip のフッタ (CRC32 と ISIZE) を欠いた
+	// 出力を成功として返す。
+	//
+	// なお -o - でのパイプ切断はここには来ない。Go の runtime は fd 1 と 2
+	// の SIGPIPE を EPIPE に変換せず再送するため、プロセスが signal で死ぬ。
+	// 読み手が消えている以上、拾っても回復できるものはない。
+	//
+	// 呼び出し側は成果物が使えないことに気づけないため、必ず拾う。
+	// 先に入ったエラーを優先する。原因に近いのは最初のエラーである。
+	keepErr := func(e error) {
+		if e != nil && err == nil {
+			err = e
+		}
+	}
+
+	// サマリは Flush と Close より先に defer へ積む。defer は LIFO なので、
+	// 最初に積んだこれが最後に走る。
+	//
+	// gzip のサイズは ofile.Stat() で読む。4MB の bufio バッファと gzip の
+	// 内部バッファは Flush と Close で初めてファイルへ届くため、それより
+	// 前に Stat するとバッファに残った分を数えず、実際のファイルより
+	// 小さい値を報告する。30 万件で 2.44 MB と 2.63 MB の差が出る。
+	//
+	// storeCount と bsCounter はクロージャが参照する。宣言はこの後だが、
+	// 実行時には確定している。
+	var storeCount, bsCounter int
+	storeTime := 0.0
+	defer func() {
+		// 標準出力ではサイズを報告しない。パイプや端末の Stat は
+		// 書き出したバイト数を返さない。
+		if !enableGzip || isStdout {
+			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
+			return
+		}
+		// ofile.Stat() ではなくパスで Stat する。ofile はこの時点で
+		// 閉じられており、file already closed になる。
+		stat, e := os.Stat(outputFile)
+		if e != nil {
+			log.Printf("total exported %d items; total_raw_bytes: %.2f MB; gzip size の取得に失敗した: %s", storeCount, getMb(int64(bsCounter)), e)
+			return
+		}
+		log.Printf("total exported %d items; total_raw_bytes: %.2f MB;the gzip size: %.2f MB", storeCount, getMb(int64(bsCounter)), getMb(stat.Size()))
+	}()
+
+	// 標準出力は閉じない。閉じると後続の書き込みが失敗する。
+	if !isStdout {
+		defer func() { keepErr(ofile.Close()) }()
+	}
+
 	var targetWriter io.Writer
 	if enableGzip{
 		zip := gzip.NewWriter(ofile)
-		defer zip.Flush()
-		defer zip.Close()
+		// gzip の Close はフッタを書く。Flush だけでは gzip ストリームが
+		// 完成しない。defer は LIFO で、bufio の Flush より後に走る。
+		defer func() { keepErr(zip.Close()) }()
 		targetWriter=zip
 	}else{
 		targetWriter=ofile
 	}
 
 	outputWriter:=bufio.NewWriterSize(targetWriter,1<<22)
-	defer outputWriter.Flush()
+	defer func() { keepErr(outputWriter.Flush()) }()
 	pageSize := PageSize
 	if pageSize <= 0 {
 		pageSize = 100
@@ -282,12 +402,18 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	var count int64
 	var totalFetchTime int64 // ナノ秒。複数のスライスから加算する
 
+	// fetchErrs は各スライスのエラーを集める。1 本でも失敗したら export は
+	// 全件を出力できていない。ExportData の戻り値に反映して呼び出し側が
+	// 気づけるようにする。以前は log.Fatalln で即死していたため、失敗を
+	// 判別する手段が終了コードしかなく、書き出し中のデータも失われていた。
+	fetchErrs := make([]error, slices)
+
 	var wg sync.WaitGroup
 	for i := 0; i < slices; i++ {
 		wg.Add(1)
 		go func(sliceID int) {
 			defer wg.Done()
-			fetchSlice(esUrl, indexName, matchBody, pageSize, sliceID, slices, dataChan, &count, &totalFetchTime)
+			fetchErrs[sliceID] = fetchSlice(esUrl, indexName, matchBody, pageSize, sliceID, slices, dataChan, &count, &totalFetchTime)
 		}(i)
 	}
 
@@ -297,19 +423,32 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 		log.Println("totalFetchTime", time.Duration(atomic.LoadInt64(&totalFetchTime)).Seconds(), "s")
 	}()
 
-	storeTime :=0.0
-	bsCounter:=0
-	storeCount :=0
+	// writeErr は書き出し側のエラーである。err に直接入れず分けているのは、
+	// 最後に fetch 側のエラーと合わせて判定するためである。
+	var writeErr error
 	for  chanItem := range dataChan {
+		// 書き出しに失敗した後もチャネルは読み切る。
+		//
+		// ここで break すると受信側が消える。fetchSlice は dataChan への
+		// 送信でブロックしたまま止まり、wg.Wait() が返らないため close も
+		// 行われず、プロセスがハングする。バッファは 300 しかないため、
+		// 大きなインデックスでは確実にこの状態になる。
+		if writeErr != nil {
+			continue
+		}
 		storeCount +=1
 		hit:=chanItem.(elastic.SearchHit)
 		item:=hitItem{hit.Index, hit.Id, 1, hit.Source}
 		bs,_:=json.Marshal(&item)
-		_, err = outputWriter.Write(bs)
-		_, err = outputWriter.Write([]byte("\n"))
-		if err != nil {
-			log.Println("io err:",err)
-			break
+		if _, e := outputWriter.Write(bs); e != nil {
+			log.Println("io err:", e)
+			writeErr = e
+			continue
+		}
+		if _, e := outputWriter.Write([]byte("\n")); e != nil {
+			log.Println("io err:", e)
+			writeErr = e
+			continue
 		}
 		bsCounter+=len(bs)
 		// 0 は無効を意味する。剰余は 0 で panic するため必ず先に弾く。
@@ -318,15 +457,12 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 			storeTime =0
 		}
 	}
+
+	// fetch 側のエラーを集約する。書き出しは成功していても全件揃っていない
+	// ため、成功として返してはいけない。
+	err = errors.Join(append([]error{writeErr}, fetchErrs...)...)
 	if err != nil {
 		log.Print(err)
-	}
-	if  enableGzip {
-		stat, _ := ofile.Stat()
-		fsize := getMb(stat.Size())
-		log.Printf("total exported %d items; total_raw_bytes: %.2f MB;the gzip size: %.2f MB", storeCount, getMb(int64(bsCounter)), fsize)
-	}else{
-		log.Printf("total exported %d items; total_raw_bytes: %.2f MB; storeTime %f", storeCount, getMb(int64(bsCounter)), storeTime)
 	}
 	return err
 }

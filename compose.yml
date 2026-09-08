@@ -1,0 +1,36 @@
+# 統合テスト用の OpenSearch である。
+#
+# 本番相当の構成は目的ではない。sliced scroll の全件性やページ境界を
+# 実際の scroll API で検証するための最小構成である。
+#
+# ポートは 9200 を使わない。開発機では他の Elasticsearch / OpenSearch と
+# 衝突するためである。19217 はホスト側だけで、コンテナ内は 9200 のままである。
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    environment:
+      # 単一ノードで動かす。レプリカを待って yellow のまま止まるのを避ける。
+      - discovery.type=single-node
+      # セキュリティプラグインを切る。TLS と認証が不要になり、テストが
+      # http:// のまま書ける。テスト専用であり本番では絶対に外さない。
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Esdump-Integration-Test-1
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      # ホスト側は 127.0.0.1 に束縛する。LAN からの到達を避けるためである。
+      - "127.0.0.1:19217:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s

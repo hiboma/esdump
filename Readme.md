@@ -209,3 +209,42 @@ To verify the release configuration locally:
 make release-check      # validate .goreleaser.yml
 make release-snapshot   # build artifacts into dist/ without publishing
 ```
+
+## Tests
+
+Unit tests need nothing but Go. Integration tests talk to a real OpenSearch,
+because sliced scroll behaviour — whether every document is returned exactly
+once, and where the page boundaries fall — cannot be checked against a mock.
+
+```shell script
+make test/short        # unit tests only; no container needed
+make test/integration  # start OpenSearch, run every test, keep it running
+make test/down         # stop and remove the container
+```
+
+`make test` runs everything and skips the integration tests when OpenSearch is
+not reachable. Set `ESDUMP_TEST_ES_REQUIRED=1` to turn that skip into a
+failure, which is what CI does so that integration tests cannot quietly stop
+running.
+
+The container listens on `127.0.0.1:19217`. Port 9200 is deliberately avoided
+so it does not clash with another Elasticsearch or OpenSearch on the same
+machine. Override the endpoint with `ESDUMP_TEST_ES`.
+
+The integration tests delete and recreate the indices they seed, so two guards
+stand in the way of doing that to something you care about: the endpoint has to
+resolve to a loopback host unless `ESDUMP_TEST_ALLOW_REMOTE=1` says otherwise,
+and every seeded index name has to start with `esdump_test_`. A health check
+cannot serve as that guard — a production cluster answers it more reliably than
+a container you forgot to start.
+
+### Seeding a larger index by hand
+
+The integration tests seed a few hundred documents each, which is enough for
+correctness but not for measuring throughput. To seed a larger index:
+
+```shell script
+make test/seed COUNT=1000000 SHARDS=5
+./esdump export --es http://127.0.0.1:19217 --index esdump_bench \
+  --size 1000 --slices 5 -o /tmp/bench.json.gz
+```

@@ -70,18 +70,34 @@ var LogTimezone string
 //
 // PersistentPreRun から呼ぶ。フラグの解析後でなければ LogTimezone が
 // 既定値のままになるため、init() では設定できない。
+//
+// 解析できないタイムゾーンは異常終了させる。既定の書式に落として続行すると、
+// 意図と違うタイムゾーンで長時間のログが残る。
 func setupLogTimezone() {
-	if LogTimezone == "" {
-		return
+	if err := applyLogTimezone(LogTimezone); err != nil {
+		log.Fatalf("%s", err)
+	}
+}
+
+// applyLogTimezone は名前で指定されたタイムゾーンを time.Local に設定する。
+//
+// setupLogTimezone から os.Exit する部分を分けている。log.Fatalf は
+// os.Exit を呼ぶため、テストからは検証できない。エラーを返す関数に分けて
+// おけば、不正な名前を弾く挙動そのものをテストできる。
+//
+// 空文字はローカルタイムのままとする。フラグの既定値であり、指定なしを
+// 意味する。
+func applyLogTimezone(name string) error {
+	if name == "" {
+		return nil
 	}
 
-	loc, err := time.LoadLocation(LogTimezone)
+	loc, err := time.LoadLocation(name)
 	if err != nil {
-		// 解析できないタイムゾーンは異常終了させる。既定の書式に落として
-		// 続行すると、意図と違うタイムゾーンで長時間のログが残る。
-		log.Fatalf("cannot load timezone %q: %s", LogTimezone, err)
+		return fmt.Errorf("cannot load timezone %q: %w", name, err)
 	}
 	time.Local = loc
+	return nil
 }
 
 func init() {

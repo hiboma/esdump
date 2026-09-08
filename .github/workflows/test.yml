@@ -1,0 +1,58 @@
+name: test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+# ジョブ単位で宣言し、将来ジョブを追加したときに権限が継承されないようにする
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    # 統合テストは実際の OpenSearch に scroll API を投げて検証する。
+    # sliced scroll の全件性やページ境界はモックでは確認できない。
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.19.1
+        env:
+          discovery.type: single-node
+          # セキュリティプラグインを切る。CI 内でしか到達できないため
+          # TLS と認証は不要である。本番では絶対に外さない設定である。
+          DISABLE_SECURITY_PLUGIN: "true"
+          DISABLE_INSTALL_DEMO_CONFIG: "true"
+          OPENSEARCH_INITIAL_ADMIN_PASSWORD: Esdump-Integration-Test-1
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 19217:9200
+        options: >-
+          --health-cmd "curl -sf http://localhost:9200/_cluster/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 40
+          --health-start-period 20s
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # ESDUMP_TEST_ES_REQUIRED を立てると、OpenSearch に繋がらない場合を
+      # スキップではなく失敗として扱う。CI で統合テストが静かに
+      # スキップされ続けるのを防ぐ。
+      - name: Run tests
+        run: go test ./... -v -timeout 600s
+        env:
+          ESDUMP_TEST_ES: http://127.0.0.1:19217
+          ESDUMP_TEST_ES_REQUIRED: "1"

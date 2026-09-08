@@ -1,29 +1,50 @@
 package main
 
 import (
-	"compress/gzip"
-	"esdump/cmds"
-	//"io/ioutil"
-	"log"
-	"os"
+	"os/exec"
+	"strings"
 	"testing"
 )
 
-func Test_Gzip(t *testing.T){
-	log.Println(string([]byte("a\r\nb")))
-	return
-	infile,err:=os.Open("/home/wxf/.ssh/config")
-	if err != nil {
-		log.Fatalln(err)
-	}
-	_,err1:=gzip.NewReader(infile)
-	t.Log("gzip new reader",err1)
-	//ioutil.ReadAll(greader)
-
-}
-func Test_Export(t *testing.T){
+// Test_Build はパッケージがビルドできることを確認する。
+//
+// 統合テストは cmds パッケージ側にある。main パッケージは cmds.Execute() を
+// 呼ぶだけであり、ここで検証するものは配線が通っていることだけである。
+//
+// 以前ここにあった Test_Gzip は先頭で return しており何も検証していなかった。
+// Test_Export は到達できないホスト (http://brige:9200) を参照していた。
+// どちらも失敗を検出できないため、実際に検証する内容へ置き換えた。
+func Test_Build(t *testing.T) {
 	if testing.Short() {
-		t.Skip("Elasticsearch に接続するため -short ではスキップする")
+		t.Skip("go build を実行するため -short ではスキップする")
 	}
-	cmds.ExportData(cmds.Output,"http://brige:9200","tmp_index","")
+	cmd := exec.Command("go", "build", "-o", t.TempDir()+"/esdump", ".")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build に失敗した: %s\n%s", err, out)
+	}
+}
+
+// Test_Help はサブコマンドが登録されていることを確認する。
+//
+// cobra へのコマンド登録は init() で行われる。登録が漏れるとフラグの
+// 追加時などに気づかないまま export や import が消える。
+func Test_Help(t *testing.T) {
+	if testing.Short() {
+		t.Skip("バイナリを実行するため -short ではスキップする")
+	}
+	bin := t.TempDir() + "/esdump"
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build に失敗した: %s\n%s", err, out)
+	}
+
+	out, err := exec.Command(bin, "--help").CombinedOutput()
+	if err != nil {
+		t.Fatalf("--help の実行に失敗した: %s\n%s", err, out)
+	}
+	for _, want := range []string{"export", "import", "version"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("--help に %q が含まれない:\n%s", want, out)
+		}
+	}
 }
