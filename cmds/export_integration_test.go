@@ -111,7 +111,11 @@ func Test_ExportData_MaxDocs(t *testing.T) {
 	}{
 		{name: "単一 scroll", maxDocs: 120, pageSize: 100, slices: 1, exact: true},
 		{name: "単一 scroll / ページ境界", maxDocs: 100, pageSize: 100, slices: 1, exact: true},
-		{name: "sliced", maxDocs: 120, pageSize: 100, slices: 3, exact: false},
+		// pageSize は小さく取る。許容上限は maxDocs + slices*pageSize であり、
+		// pageSize が大きいと上限が緩くなって per-slice で数えるバグを
+		// 通してしまう。pageSize 100 では上限が 420 になり、全件 500 を
+		// 出力しない限り検出できない。
+		{name: "sliced", maxDocs: 120, pageSize: 10, slices: 3, exact: false},
 		{name: "sliced / size が小さい", maxDocs: 50, pageSize: 7, slices: 3, exact: false},
 	}
 

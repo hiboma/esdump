@@ -1,10 +1,14 @@
 package cmds
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"strconv"
 	"testing"
+
+	"github.com/olivere/elastic/v7"
 )
 
 // withImportDefaults は import のグローバル変数をテスト用に設定して戻す。
@@ -139,9 +143,23 @@ func Test_ExportData_FetchError(t *testing.T) {
 	// 空インデックスの 400 とは別物であり、飲み込まずにエラーとして返る
 	// 必要がある。
 	out := filepath.Join(t.TempDir(), "export.json.gz")
-	err := ExportData(out, esUrl, "esdump_test_no_such_index_xyz", "")
+	err := ExportData(out, esUrl, testIndexPrefix+"no_such_index_xyz", "")
 	if err == nil {
 		t.Fatal("存在しないインデックスでエラーが返らなかった")
+	}
+
+	// エラーの中身まで確認する。err != nil だけでは、ファイルのオープン
+	// 失敗など別の理由で通ってしまい、scroll のエラーが伝わることを
+	// 確認できない。
+	var esErr *elastic.Error
+	if !errors.As(err, &esErr) {
+		t.Fatalf("*elastic.Error が返らなかった: %#v", err)
+	}
+	if esErr.Status != http.StatusNotFound {
+		t.Errorf("404 を期待した: got %d", esErr.Status)
+	}
+	if esErr.Details == nil || esErr.Details.Type != "index_not_found_exception" {
+		t.Errorf("index_not_found_exception を期待した: got %#v", esErr.Details)
 	}
 	t.Logf("期待通りエラーが返った: %s", err)
 }
