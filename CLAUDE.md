@@ -215,8 +215,9 @@ stdlib 脆弱性を含んだバイナリを配布します。実際に `toolchai
 - Dependabot alerts と security updates を有効化しています
 - Secret scanning と push protection を有効化しています (public リポジトリなので無償)
 - master に Repository Ruleset を設定しています。force push と削除を禁止し、
-  PR と `test` の通過を必須にしています。単独開発なので承認数は 0 です。
-  repository admin を bypass に入れているため、詰まった場合は迂回できます
+  PR と `test` / `workflow-lint` / `vulncheck` の通過を必須にしています。
+  単独開発なので承認数は 0 です。repository admin を bypass に
+  入れているため、詰まった場合は迂回できます
 
 ```bash
 gh api repos/hiboma/esdump/rulesets
