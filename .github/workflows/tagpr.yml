@@ -70,7 +70,11 @@ jobs:
           # 実行時に決まると、この workflow が他で徹底している固定が
           # 最後の一段で崩れる。更新は Dependabot が追えないため手動で
           # 上げる (goreleaser-action の SHA とは別に指定する必要がある)。
-          version: "2.18.1"
+          #
+          # 上げる際は公開から 7 日以上経った版を選ぶ。Dependabot の
+          # cooldown と同じ基準に揃えるためである。ここだけ公開直後の版を
+          # 掴むと、リリース経路が最も弱い一点になる。
+          version: "2.18.0"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

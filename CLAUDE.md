@@ -164,8 +164,11 @@ gh api -X POST "repos/hiboma/esdump/actions/runs/$RID/approve"
 `goreleaser-action` の `version` は `~> v2` のような浮動範囲にしません。
 リリース成果物を作るバイナリ自体が実行時に決まると、他で徹底している
 固定が最後の一段で崩れます。action の SHA を固定しても、action が
-ダウンロードする goreleaser は別物である点に注意します。Dependabot は
-この値を追えないため、更新は手動です。
+ダウンロードする goreleaser は別物である点に注意します。
+
+Dependabot はこの値を追えないため、更新は手動です。上げる際は公開から
+7 日以上経った版を選び、Dependabot の cooldown と基準を揃えます。
+ここだけ公開直後の版を掴むと、リリース経路が最も弱い一点になります。
 
 Dependabot には全エコシステムに `cooldown: 7` を設定しています。公開直後の
 バージョンを掴まないための待機期間です。CVE 対応のセキュリティ更新は
