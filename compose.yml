@@ -7,7 +7,10 @@
 # 衝突するためである。19217 はホスト側だけで、コンテナ内は 9200 のままである。
 services:
   opensearch:
-    image: opensearchproject/opensearch:2.19.1
+    # タグは可変であり、レジストリへのアクセスを得た第三者が同じタグに
+    # 改ざんしたイメージを push できる。ダイジェストで固定して
+    # 同じバイト列だけを引くようにする。更新は Renovate/Dependabot に任せる。
+    image: opensearchproject/opensearch:2.19.1@sha256:72fe2fc84be8295906b8efca020b46c58ed45c8da60cd9b8b49e1991e38e89a4
     environment:
       # 単一ノードで動かす。レプリカを待って yellow のまま止まるのを避ける。
       - discovery.type=single-node

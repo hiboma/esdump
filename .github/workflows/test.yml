@@ -19,7 +19,8 @@ jobs:
     # sliced scroll の全件性やページ境界はモックでは確認できない。
     services:
       opensearch:
-        image: opensearchproject/opensearch:2.19.1
+        # タグは可変なのでダイジェストで固定する (compose.yml と同じ理由)。
+        image: opensearchproject/opensearch:2.19.1@sha256:72fe2fc84be8295906b8efca020b46c58ed45c8da60cd9b8b49e1991e38e89a4
         env:
           discovery.type: single-node
           # セキュリティプラグインを切る。CI 内でしか到達できないため
@@ -39,6 +40,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # .git/config に GITHUB_TOKEN を残さない。残すと後続ステップや
+          # actions/upload-artifact 経由でトークンが漏れる経路ができる。
+          # このジョブは push しないため不要である。
+          persist-credentials: false
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
