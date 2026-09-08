@@ -131,6 +131,19 @@ Settings > Actions > General で以下が必要です。
 `.tagpr` に `release = false` を設定していますが、この場合も tagpr は `tag` output を
 設定します (`setOutput` が early return より前で実行されるため)。後続の GoReleaser は動きます。
 
+**リリース PR に対するワークフローは承認が必要です**。tagpr が `GITHUB_TOKEN` で
+作成した PR では、`pull_request` トリガのワークフローが `action_required` で
+止まります。タグ push と同じ無限ループ防止の仕組みによるものです。
+
+master 側の CI は同じコードで動くため、リリース PR の差分 (CHANGELOG.md と
+バージョンのみ) を確認したうえでマージしても構いません。PR 単体で CI を
+通したい場合は承認します。
+
+```bash
+RID=$(gh run list --workflow=test.yml --branch=tagpr-from-vX.Y.Z --limit 1 --json databaseId --jq '.[0].databaseId')
+gh api -X POST "repos/hiboma/esdump/actions/runs/$RID/approve"
+```
+
 ## アーキテクチャ
 
 ### プロジェクト構造
