@@ -1,9 +1,11 @@
 package cmds
 
 import (
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -198,5 +200,63 @@ func Test_ExportData_EmptyIndexSliced(t *testing.T) {
 				t.Errorf("空インデックスから %d 件が出力された", len(got))
 			}
 		})
+	}
+}
+
+// Test_ImportData_NotGzipped は gzip ではないファイルを gzip として読ませた
+// ときにエラーが返ることを確認する。
+//
+// この分岐は名前付き戻り値の err を返していた。オープンが成功した時点で
+// err は nil であり、非 gzip ファイルを渡しても 0 件を import して正常終了
+// していた。export | import のパイプラインで、壊れたダンプと成功を
+// 区別できなくなる。
+func Test_ImportData_NotGzipped(t *testing.T) {
+	esUrl := requireEs(t)
+
+	indexName := testIndexPrefix + "import_notgzip"
+	seedIndex(t, esUrl, indexName, 0, 1)
+
+	withImportDefaults(t)
+
+	// gzip ヘッダを持たないファイルを作る。中身は正しい JSON Lines に
+	// しておく。gzip の判定より先に内容が読まれることはない。
+	plain := filepath.Join(t.TempDir(), "plain.json")
+	body := `{"_index":"x","_id":"1","_score":1,"_source":{"n":1}}` + "\n"
+	if err := os.WriteFile(plain, []byte(body), 0o644); err != nil {
+		t.Fatalf("テスト用ファイルの作成に失敗した: %s", err)
+	}
+
+	err := ImportData(plain, esUrl, indexName)
+	if err == nil {
+		t.Fatal("非 gzip ファイルでエラーが返らなかった")
+	}
+	if !errors.Is(err, gzip.ErrHeader) {
+		t.Errorf("gzip.ErrHeader を期待した: got %v", err)
+	}
+
+	// 何も import されていないことを確認する。エラーを返しつつ一部だけ
+	// 書き込んでいると、再実行時の状態が読めない。
+	if got := countDocs(t, esUrl, indexName); got != 0 {
+		t.Errorf("エラー時に %d 件が import された", got)
+	}
+}
+
+// Test_ImportData_OpenError は入力ファイルを開けないときにエラーが返ることを
+// 確認する。
+//
+// 以前は log.Fatalf で os.Exit していた。defer した inFile.Close() を
+// 飛ばすうえ、RunE がエラーを受け取る経路も通らない。
+func Test_ImportData_OpenError(t *testing.T) {
+	esUrl := requireEs(t)
+
+	withImportDefaults(t)
+
+	missing := filepath.Join(t.TempDir(), "no_such_file.json.gz")
+	err := ImportData(missing, esUrl, testIndexPrefix+"import_openerr")
+	if err == nil {
+		t.Fatal("存在しないファイルでエラーが返らなかった")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("os.ErrNotExist を期待した: got %v", err)
 	}
 }

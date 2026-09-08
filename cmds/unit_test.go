@@ -284,6 +284,34 @@ func Test_assertLocalTestEndpoint(t *testing.T) {
 	}
 }
 
+// Test_esRequired は ESDUMP_TEST_ES_REQUIRED の値判定を確認する。
+//
+// 空でないことを条件にすると ESDUMP_TEST_ES_REQUIRED=0 が有効になり、
+// 無効化したつもりの指定が有効として扱われる。ドキュメントも Makefile も
+// =1 と書いているため、1 だけを受ける。
+func Test_esRequired(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{value: "1", want: true},
+		{value: "", want: false},
+		{value: "0", want: false},
+		{value: "true", want: false},
+		{value: "yes", want: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run("value="+tt.value, func(t *testing.T) {
+			t.Setenv("ESDUMP_TEST_ES_REQUIRED", tt.value)
+			if got := esRequired(); got != tt.want {
+				t.Errorf("esRequired() = %v, want %v (値 %q)", got, tt.want, tt.value)
+			}
+		})
+	}
+}
+
 // Test_testIndexPrefix は seedIndex がインデックス名の接頭辞を強制する
 // ことを確認する。
 //

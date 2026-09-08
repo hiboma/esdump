@@ -90,6 +90,27 @@ func checkLocalTestEndpoint(esUrl string) error {
 		"ESDUMP_TEST_ALLOW_REMOTE=1 が必要である", esUrl)
 }
 
+// esRequired は OpenSearch に到達できない場合を失敗として扱うかを返す。
+//
+// 値は 1 だけを受ける。ESDUMP_TEST_ALLOW_REMOTE と揃える。空でないことを
+// 条件にすると ESDUMP_TEST_ES_REQUIRED=0 が有効になり、無効化したつもりの
+// 指定が有効として扱われる。
+func esRequired() bool {
+	return os.Getenv("ESDUMP_TEST_ES_REQUIRED") == "1"
+}
+
+// skipOrFail は OpenSearch が使えない理由を、スキップか失敗として扱う。
+//
+// ESDUMP_TEST_ES_REQUIRED=1 なら失敗させる。CI で統合テストが静かに
+// スキップされ続け、green のまま検証が止まるのを防ぐためである。
+func skipOrFail(t *testing.T, format string, args ...interface{}) {
+	t.Helper()
+	if esRequired() {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
 // requireEs は OpenSearch に到達できなければテストをスキップする。
 //
 // -short でのスキップと、コンテナ未起動でのスキップを分けている。
@@ -110,14 +131,21 @@ func requireEs(t *testing.T) string {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(url + "/_cluster/health")
 	if err != nil {
-		if os.Getenv("ESDUMP_TEST_ES_REQUIRED") != "" {
-			t.Fatalf("OpenSearch (%s) に接続できない: %s", url, err)
-		}
-		t.Skipf("OpenSearch (%s) に接続できないためスキップする (make test/up で起動する): %s", url, err)
+		skipOrFail(t, "OpenSearch (%s) に接続できない (make test/up で起動する): %s", url, err)
+		return ""
 	}
 	defer resp.Body.Close()
+	// health が 200 以外の場合もスキップの判定を通す。
+	//
+	// ポートは繋がるがクラスタが不健全という状態がある。起動途中、OOM 後の
+	// red、といった場合である。GitHub Actions の service container は
+	// コンテナ起動と同時にポートを公開するため、この状態に入りやすい。
+	//
+	// ここを無条件のスキップにすると、CI が全テストをスキップして green を
+	// 返す。ESDUMP_TEST_ES_REQUIRED はまさにこれを防ぐための指定である。
 	if resp.StatusCode != http.StatusOK {
-		t.Skipf("OpenSearch (%s) の health が %d を返した", url, resp.StatusCode)
+		skipOrFail(t, "OpenSearch (%s) の health が %d を返した", url, resp.StatusCode)
+		return ""
 	}
 	return url
 }
@@ -217,10 +245,14 @@ func flushBulk(ctx context.Context, t *testing.T, bulk *elastic.BulkService) err
 	if err != nil {
 		return err
 	}
+	// Errors が立っていれば必ずエラーを返す。Failed() の中身を見るループ
+	// だけで判定すると、Errors が真でも Failed() が空のレスポンスを成功と
+	// して扱う。seed が意図通りでないまま export の件数を比べることになる。
 	if res.Errors {
-		for _, item := range res.Failed() {
-			return fmt.Errorf("bulk item error: %v", item.Error)
+		if failed := res.Failed(); len(failed) > 0 {
+			return fmt.Errorf("bulk item error: %v", failed[0].Error)
 		}
+		return fmt.Errorf("bulk レスポンスが errors=true を返したが失敗した項目が無い")
 	}
 	return nil
 }
