@@ -159,6 +159,13 @@ gh api -X POST "repos/hiboma/esdump/actions/runs/$RID/approve"
 | OpenSearch イメージ | `@sha256:` ダイジェスト固定 | Dependabot (docker) |
 | Go の依存 | go.sum + `toolchain` | Dependabot (gomod) |
 | CI で入れるツール | バージョン固定 + `sha256sum -c` | 手動 (checksum を併記) |
+| goreleaser 本体 | `version:` に厳密な semver | 手動 |
+
+`goreleaser-action` の `version` は `~> v2` のような浮動範囲にしません。
+リリース成果物を作るバイナリ自体が実行時に決まると、他で徹底している
+固定が最後の一段で崩れます。action の SHA を固定しても、action が
+ダウンロードする goreleaser は別物である点に注意します。Dependabot は
+この値を追えないため、更新は手動です。
 
 Dependabot には全エコシステムに `cooldown: 7` を設定しています。公開直後の
 バージョンを掴まないための待機期間です。CVE 対応のセキュリティ更新は
@@ -222,6 +229,20 @@ stdlib 脆弱性を含んだバイナリを配布します。実際に `toolchai
 ```bash
 gh api repos/hiboma/esdump/rulesets
 ```
+
+### CODEOWNERS の注意点
+
+構文が不正な行はエラーにならず黙ってスキップされます。保護しているつもりの
+ファイルが無保護になるため、変更後は GitHub のパーサで検証します。
+
+```bash
+gh api "repos/hiboma/esdump/codeowners/errors?ref=<branch>"
+```
+
+`{"errors":[]}` なら全行が有効です。なお単独開発では CODEOWNERS から
+第二者レビューは生まれません (自分の PR は自分で承認できないため)。
+実効的な価値は機微なファイルの明示と、fork からの外部 PR に対する
+承認要求です。実際の防御は SHA 固定・checksum 照合・Dependabot が担います。
 
 ## アーキテクチャ
 
