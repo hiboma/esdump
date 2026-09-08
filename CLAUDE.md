@@ -111,9 +111,38 @@ make release-snapshot  # publish せずに dist/ へ成果物をビルドする
   - アーカイブ名のバージョンには `v` が付きません。タグ `v1.2.3` に対して `esdump_1.2.3_linux_amd64.tar.gz` です
 - `.github/workflows/tagpr.yml` — tagpr と GoReleaser を1つのジョブで実行します
 
-**重要**: tagpr が `GITHUB_TOKEN` で打ったタグは push イベントを発火しません
+### リポジトリ設定の前提
+
+Settings > Actions > General で以下が必要です。
+
+- **Allow GitHub Actions to create and approve pull requests を有効にする**
+  無効にすると tagpr のリリース PR 作成が
+  `403 GitHub Actions is not permitted to create or approve pull requests` で失敗します。
+  この設定は PR の「作成」と「承認」を分離できないため、tagpr を使う限り有効が必須です。
+- Workflow permissions は `Read repository contents` で構いません。
+  `tagpr.yml` がジョブ単位で `contents: write` と `pull-requests: write` を宣言しています。
+
+### 仕様上の制約
+
+**tagpr が `GITHUB_TOKEN` で打ったタグは push イベントを発火しません**
 (GitHub の無限ループ防止仕様)。そのためリリースを別ワークフローに分けず、
 タグを打った同じジョブ内で `steps.tagpr.outputs.tag` を条件に GoReleaser を実行しています。
+
+`.tagpr` に `release = false` を設定していますが、この場合も tagpr は `tag` output を
+設定します (`setOutput` が early return より前で実行されるため)。後続の GoReleaser は動きます。
+
+**リリース PR に対するワークフローは承認が必要です**。tagpr が `GITHUB_TOKEN` で
+作成した PR では、`pull_request` トリガのワークフローが `action_required` で
+止まります。タグ push と同じ無限ループ防止の仕組みによるものです。
+
+master 側の CI は同じコードで動くため、リリース PR の差分 (CHANGELOG.md と
+バージョンのみ) を確認したうえでマージしても構いません。PR 単体で CI を
+通したい場合は承認します。
+
+```bash
+RID=$(gh run list --workflow=test.yml --branch=tagpr-from-vX.Y.Z --limit 1 --json databaseId --jq '.[0].databaseId')
+gh api -X POST "repos/hiboma/esdump/actions/runs/$RID/approve"
+```
 
 ## アーキテクチャ
 
