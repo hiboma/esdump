@@ -19,13 +19,23 @@ import (
 	"sync/atomic"
 	"time"
 )
+// Run ではなく RunE を使う。cobra は Run の戻り値を持たないため、
+// エラーが呼び出し側に伝わらず終了コードが 0 のままになる。
+//
+// export が一部のスライスで失敗して全件揃っていない場合に成功と区別できない
+// と、シェルや cron、CI から見て取りこぼしに気づけない。Execute() は
+// エラーを受けて os.Exit(1) する。
 var exportCmd = &cobra.Command{
 	Use:   "export",
 	Short: "elasticsearch export",
 	Long:  `elasticsearch export`,
-	Run: func(cmd *cobra.Command, args []string) {
+	// エラーは Execute() が 1 度出力するため、cobra 側の重複出力を止める。
+	// usage も出さない。引数の誤りではなく実行時の失敗である。
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		log.Printf("export index %s to %s",IndexName,Output)
-		ExportData(Output,EsUrl,IndexName,MatchBody)
+		return ExportData(Output,EsUrl,IndexName,MatchBody)
 	},
 }
 
@@ -33,12 +43,11 @@ var importCmd = &cobra.Command{
 	Use:   "import",
 	Short: "elasticsearch import",
 	Long:  `elasticsearch import`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		log.Printf("import index %s from %s",IndexName,Input)
-		err:=ImportData(Input,EsUrl,IndexName)
-		if err != nil {
-			log.Println(err)
-		}
+		return ImportData(Input,EsUrl,IndexName)
 	},
 }
 var Output string
@@ -285,7 +294,8 @@ func isEmptyIndexSliceErr(err error) bool {
 
 func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 	var ofile *os.File
-	if outputFile=="-"{
+	isStdout := outputFile == "-"
+	if isStdout{
 		ofile=os.Stdout
 	}else{
 		if enableGzip && !strings.HasSuffix(outputFile,".gz"){
@@ -293,24 +303,47 @@ func ExportData(outputFile ,esUrl,indexName,matchBody string)(err error) {
 		}
 		ofile, err= os.OpenFile(outputFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	}
-	defer ofile.Close()
 
+	// オープンの成否を先に見る。失敗時は ofile が nil であり、defer に
+	// Close を積む前に返さなければ nil ポインタを参照する。
 	if err != nil {
 		log.Print("open file err", err)
 		return err
 	}
+
+	// 遅延実行のエラーは名前付き戻り値へ書き戻す。
+	//
+	// 4MB の bufio バッファと gzip の内部バッファに残ったデータは、最後の
+	// Flush と Close で初めてファイルへ届く。ENOSPC や -o - でのパイプ切断が
+	// ここで起きると、書き出し中は成功していたため戻り値が nil のまま
+	// 出力が壊れる。gzip のフッタ (CRC32 と ISIZE) も欠ける。
+	//
+	// 呼び出し側は成果物が使えないことに気づけないため、必ず拾う。
+	// 先に入ったエラーを優先する。原因に近いのは最初のエラーである。
+	keepErr := func(e error) {
+		if e != nil && err == nil {
+			err = e
+		}
+	}
+
+	// 標準出力は閉じない。閉じると後続の書き込みが失敗する。
+	if !isStdout {
+		defer func() { keepErr(ofile.Close()) }()
+	}
+
 	var targetWriter io.Writer
 	if enableGzip{
 		zip := gzip.NewWriter(ofile)
-		defer zip.Flush()
-		defer zip.Close()
+		// gzip の Close はフッタを書く。Flush だけでは gzip ストリームが
+		// 完成しない。defer は LIFO で、bufio の Flush より後に走る。
+		defer func() { keepErr(zip.Close()) }()
 		targetWriter=zip
 	}else{
 		targetWriter=ofile
 	}
 
 	outputWriter:=bufio.NewWriterSize(targetWriter,1<<22)
-	defer outputWriter.Flush()
+	defer func() { keepErr(outputWriter.Flush()) }()
 	pageSize := PageSize
 	if pageSize <= 0 {
 		pageSize = 100
