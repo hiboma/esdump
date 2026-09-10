@@ -129,7 +129,9 @@ the document body is in the `_source` field.
 > These field names differ from upstream, which writes `{"ID":...,"RawData":...}`.
 > The names here match an Elasticsearch response hit, so the output lines up with
 > [elasticsearch-dump](https://github.com/elasticsearch-dump/elasticsearch-dump).
-> Dumps written by this fork cannot be imported by the upstream esdump.
+> Dumps are **not interchangeable with upstream esdump in either direction**, and
+> a mismatched dump fails silently: import reports a row count and exits 0 while
+> storing nothing. `_score` is always the literal `1`, not a real score.
 > See [FORK.md](FORK.md#出力フォーマットの変更).
 
 sorry my bad english
