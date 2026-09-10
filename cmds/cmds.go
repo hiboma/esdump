@@ -203,7 +203,17 @@ func flushImportBulk(iserv *elastic.BulkService, failed *int, firstFailure *stri
 	if err != nil {
 		return fmt.Errorf("bulk request に失敗した: %w", err)
 	}
-	for _, item := range res.Failed() {
+	items := res.Failed()
+	// Errors が立っているのに失敗した項目が無い応答を成功として扱わない。
+	//
+	// Failed() は Items が nil なら nil を返し、status が 2xx 以外の項目
+	// だけを拾う。errors=true で items が空の応答では、このループが 1 度も
+	// 回らず、全件が拒否されていても成功になる。件数を数える対象が無い
+	// 以上、ここは中断して呼び出し側に返すしかない。
+	if res.Errors && len(items) == 0 {
+		return errors.New("bulk レスポンスが errors=true を返したが失敗した項目が無い")
+	}
+	for _, item := range items {
 		*failed++
 		if *firstFailure == "" {
 			*firstFailure = describeBulkFailure(item)
@@ -212,7 +222,21 @@ func flushImportBulk(iserv *elastic.BulkService, failed *int, firstFailure *stri
 	return nil
 }
 
+// maxReasonLen は拒否の理由を切り詰める長さである。
+//
+// ES の Reason にはドキュメントのフィールド値が
+// "Preview of field's value: '...'" として埋め込まれる。この preview は
+// ES 側で切り詰められず、5000 文字のフィールド値は 5000 文字の理由になる。
+// 理由の情報価値は先頭の type とフィールド名にあり、末尾の値そのものは
+// デバッグにほとんど寄与しない。
+const maxReasonLen = 200
+
 // describeBulkFailure は拒否されたドキュメント 1 件の理由を 1 行にする。
+//
+// Reason はドキュメント由来の文字列を含む。エラーは Execute() が標準出力へ
+// 書くため、切り詰めずに渡すと業務データが CI のログや端末の履歴に残る。
+// 利用者がエラー全文を Issue に貼ると、そのまま公開される。
+// 全件分の理由を出す変更を入れる場合も、この点を踏まえること。
 func describeBulkFailure(item *elastic.BulkResponseItem) string {
 	if item == nil {
 		return "unknown"
@@ -220,7 +244,21 @@ func describeBulkFailure(item *elastic.BulkResponseItem) string {
 	if item.Error == nil {
 		return fmt.Sprintf("_id=%s status=%d", item.Id, item.Status)
 	}
-	return fmt.Sprintf("_id=%s status=%d type=%s reason=%s", item.Id, item.Status, item.Error.Type, item.Error.Reason)
+	return fmt.Sprintf("_id=%s status=%d type=%s reason=%s", item.Id, item.Status, item.Error.Type, truncateReason(item.Error.Reason))
+}
+
+// truncateReason は理由を maxReasonLen で切り詰める。
+//
+// 切り詰めたことが分かるようにする。切り詰めた跡がないと、理由が元から
+// そこで終わっているのか、続きがあるのか区別できない。
+func truncateReason(reason string) string {
+	// バイト数ではなく文字数で数える。マルチバイト文字の途中で切ると
+	// 不正なバイト列になる。
+	runes := []rune(reason)
+	if len(runes) <= maxReasonLen {
+		return reason
+	}
+	return string(runes[:maxReasonLen]) + "...(truncated)"
 }
 // fetchSlice は 1 本の scroll を読み切り、ヒットを dataChan へ送る。
 //
