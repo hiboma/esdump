@@ -144,39 +144,83 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 	bufReader:=bufio.NewReaderSize(sourceReader,1<<22)
 	iserv:=GetEsIndexService(esUrl,indexName)
 	counter:=0;
+	// failed は ES に拒否されたドキュメントの数である。
+	//
+	// bulk はリクエスト全体が成功しても、個々のドキュメントが拒否される。
+	// マッピング不一致 (mapper_parsing_exception) が典型で、レスポンスの
+	// items それぞれに error が入る。Do() の戻り値のエラーは HTTP や接続の
+	// 失敗しか表さないため、これを見るだけでは 1 件も入らなくても成功に見える。
+	failed := 0
+	// firstFailure は最初に拒否された理由である。件数だけでは原因が分からず、
+	// かといって全件分の理由を出すとログが溢れるため、1 件だけ残す。
+	var firstFailure string
 	for line, _, err := bufReader.ReadLine(); err != io.EOF; line, _, err = bufReader.ReadLine() {
 		counter++
 		item:=new(hitItem)
 		err=json.Unmarshal(line,item)
 		if err != nil {
-			return err
+			return fmt.Errorf("line %d の JSON を解釈できない: %w", counter, err)
 		}
 		//提交数据
 		req:= elastic.NewBulkIndexRequest()
 		req.Id(item.ID).Doc(item.Source)
 		iserv.Add(req)
 		if iserv.NumberOfActions()>999{
-			_,err=iserv.Do(context.Background())
-			if err != nil {
-				log.Println(err)
-				err=nil
+			if berr := flushImportBulk(iserv, &failed, &firstFailure); berr != nil {
+				return berr
 			}
 			log.Printf("row count %d",counter)
-		}
-		if err != nil {
-			log.Println(err)
 		}
 	}
 
 	//LAST:
 	if iserv.NumberOfActions()>0{
-		_,err=iserv.Do(context.Background())
-		if err != nil {
-			log.Println("es err", err)
+		if berr := flushImportBulk(iserv, &failed, &firstFailure); berr != nil {
+			return berr
 		}
 	}
 	log.Printf("finish import row count %d",counter)
+
+	// 拒否されたドキュメントがあれば失敗として返す。
+	//
+	// 以前はここまで到達すれば常に nil を返していた。全件が拒否されても
+	// "finish import row count N" を出して exit 0 で終わるため、cron や CI
+	// から成功と区別できなかった。件数を報告している分、成功したように読める。
+	if failed > 0 {
+		return fmt.Errorf("%d / %d 件の import が ES に拒否された: %s", failed, counter, firstFailure)
+	}
 	return
+}
+
+// flushImportBulk は溜まったリクエストを送り、拒否されたドキュメントを数える。
+//
+// 戻り値のエラーはリクエスト自体の失敗 (接続断や HTTP エラー) である。
+// この場合は以降も失敗し続けるため、呼び出し側は中断する。個々の
+// ドキュメントの拒否は failed に加算するだけで続行する。ダンプの一部に
+// 不正な行が混ざっていても、残りを入れ切るほうが実用的である。
+func flushImportBulk(iserv *elastic.BulkService, failed *int, firstFailure *string) error {
+	res, err := iserv.Do(context.Background())
+	if err != nil {
+		return fmt.Errorf("bulk request に失敗した: %w", err)
+	}
+	for _, item := range res.Failed() {
+		*failed++
+		if *firstFailure == "" {
+			*firstFailure = describeBulkFailure(item)
+		}
+	}
+	return nil
+}
+
+// describeBulkFailure は拒否されたドキュメント 1 件の理由を 1 行にする。
+func describeBulkFailure(item *elastic.BulkResponseItem) string {
+	if item == nil {
+		return "unknown"
+	}
+	if item.Error == nil {
+		return fmt.Sprintf("_id=%s status=%d", item.Id, item.Status)
+	}
+	return fmt.Sprintf("_id=%s status=%d type=%s reason=%s", item.Id, item.Status, item.Error.Type, item.Error.Reason)
 }
 // fetchSlice は 1 本の scroll を読み切り、ヒットを dataChan へ送る。
 //
