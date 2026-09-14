@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/olivere/elastic/v7"
 )
@@ -326,4 +327,86 @@ func Test_testIndexPrefix(t *testing.T) {
 	if testIndexPrefix != "esdump_test_" {
 		t.Errorf("testIndexPrefix が変わった: %q", testIndexPrefix)
 	}
+}
+
+// Test_truncateReason は拒否の理由が切り詰められることを確認する。
+//
+// ES の Reason にはドキュメントのフィールド値が埋め込まれ、ES 側では
+// 切り詰められない。エラーは標準出力へ出るため、切り詰めないと業務データが
+// CI のログや Issue に残る。
+func Test_truncateReason(t *testing.T) {
+	t.Run("上限以下はそのまま返す", func(t *testing.T) {
+		reason := "failed to parse field [n]"
+		if got := truncateReason(reason); got != reason {
+			t.Errorf("切り詰めるべきでない: got %q", got)
+		}
+	})
+
+	t.Run("上限ちょうどは切り詰めない", func(t *testing.T) {
+		reason := strings.Repeat("a", maxReasonLen)
+		if got := truncateReason(reason); got != reason {
+			t.Errorf("上限ちょうどで切り詰めた: len %d", len([]rune(got)))
+		}
+	})
+
+	t.Run("上限を超えたら切り詰めて印を付ける", func(t *testing.T) {
+		reason := "type=x " + strings.Repeat("S", 5000)
+		got := truncateReason(reason)
+		if !strings.HasSuffix(got, "...(truncated)") {
+			t.Errorf("切り詰めた印がない: %q", got[:60])
+		}
+		if n := len([]rune(strings.TrimSuffix(got, "...(truncated)"))); n != maxReasonLen {
+			t.Errorf("切り詰めた長さが違う: got %d, want %d", n, maxReasonLen)
+		}
+		// 先頭の情報は残ること。type やフィールド名はここにある。
+		if !strings.HasPrefix(got, "type=x ") {
+			t.Errorf("先頭の情報が失われた: %q", got[:20])
+		}
+	})
+
+	t.Run("マルチバイト文字を壊さない", func(t *testing.T) {
+		reason := strings.Repeat("あ", 5000)
+		got := truncateReason(reason)
+		if !utf8.ValidString(got) {
+			t.Error("不正なバイト列になった")
+		}
+		if n := len([]rune(strings.TrimSuffix(got, "...(truncated)"))); n != maxReasonLen {
+			t.Errorf("文字数で切り詰めていない: got %d", n)
+		}
+	})
+}
+
+// Test_describeBulkFailure は拒否されたドキュメントの説明を確認する。
+func Test_describeBulkFailure(t *testing.T) {
+	t.Run("nil は unknown を返す", func(t *testing.T) {
+		if got := describeBulkFailure(nil); got != "unknown" {
+			t.Errorf("got %q", got)
+		}
+	})
+
+	t.Run("Error が nil でも id と status を出す", func(t *testing.T) {
+		got := describeBulkFailure(&elastic.BulkResponseItem{Id: "a", Status: 400})
+		if !strings.Contains(got, "_id=a") || !strings.Contains(got, "status=400") {
+			t.Errorf("got %q", got)
+		}
+	})
+
+	t.Run("長い理由は切り詰める", func(t *testing.T) {
+		item := &elastic.BulkResponseItem{
+			Id:     "a",
+			Status: 400,
+			Error: &elastic.ErrorDetails{
+				Type:   "mapper_parsing_exception",
+				Reason: strings.Repeat("S", 5000),
+			},
+		}
+		got := describeBulkFailure(item)
+		if strings.Count(got, "S") > maxReasonLen {
+			t.Errorf("理由が切り詰められていない: %d 文字", strings.Count(got, "S"))
+		}
+		// 種別は残ること。原因の切り分けに要る。
+		if !strings.Contains(got, "mapper_parsing_exception") {
+			t.Errorf("type が失われた: %q", got)
+		}
+	})
 }

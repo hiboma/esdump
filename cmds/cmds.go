@@ -144,39 +144,121 @@ func ImportData(inputFile ,esUrl,indexName string)(err error){
 	bufReader:=bufio.NewReaderSize(sourceReader,1<<22)
 	iserv:=GetEsIndexService(esUrl,indexName)
 	counter:=0;
+	// failed は ES に拒否されたドキュメントの数である。
+	//
+	// bulk はリクエスト全体が成功しても、個々のドキュメントが拒否される。
+	// マッピング不一致 (mapper_parsing_exception) が典型で、レスポンスの
+	// items それぞれに error が入る。Do() の戻り値のエラーは HTTP や接続の
+	// 失敗しか表さないため、これを見るだけでは 1 件も入らなくても成功に見える。
+	failed := 0
+	// firstFailure は最初に拒否された理由である。件数だけでは原因が分からず、
+	// かといって全件分の理由を出すとログが溢れるため、1 件だけ残す。
+	var firstFailure string
 	for line, _, err := bufReader.ReadLine(); err != io.EOF; line, _, err = bufReader.ReadLine() {
 		counter++
 		item:=new(hitItem)
 		err=json.Unmarshal(line,item)
 		if err != nil {
-			return err
+			return fmt.Errorf("line %d の JSON を解釈できない: %w", counter, err)
 		}
 		//提交数据
 		req:= elastic.NewBulkIndexRequest()
 		req.Id(item.ID).Doc(item.Source)
 		iserv.Add(req)
 		if iserv.NumberOfActions()>999{
-			_,err=iserv.Do(context.Background())
-			if err != nil {
-				log.Println(err)
-				err=nil
+			if berr := flushImportBulk(iserv, &failed, &firstFailure); berr != nil {
+				return berr
 			}
 			log.Printf("row count %d",counter)
-		}
-		if err != nil {
-			log.Println(err)
 		}
 	}
 
 	//LAST:
 	if iserv.NumberOfActions()>0{
-		_,err=iserv.Do(context.Background())
-		if err != nil {
-			log.Println("es err", err)
+		if berr := flushImportBulk(iserv, &failed, &firstFailure); berr != nil {
+			return berr
 		}
 	}
 	log.Printf("finish import row count %d",counter)
+
+	// 拒否されたドキュメントがあれば失敗として返す。
+	//
+	// 以前はここまで到達すれば常に nil を返していた。全件が拒否されても
+	// "finish import row count N" を出して exit 0 で終わるため、cron や CI
+	// から成功と区別できなかった。件数を報告している分、成功したように読める。
+	if failed > 0 {
+		return fmt.Errorf("%d / %d 件の import が ES に拒否された: %s", failed, counter, firstFailure)
+	}
 	return
+}
+
+// flushImportBulk は溜まったリクエストを送り、拒否されたドキュメントを数える。
+//
+// 戻り値のエラーはリクエスト自体の失敗 (接続断や HTTP エラー) である。
+// この場合は以降も失敗し続けるため、呼び出し側は中断する。個々の
+// ドキュメントの拒否は failed に加算するだけで続行する。ダンプの一部に
+// 不正な行が混ざっていても、残りを入れ切るほうが実用的である。
+func flushImportBulk(iserv *elastic.BulkService, failed *int, firstFailure *string) error {
+	res, err := iserv.Do(context.Background())
+	if err != nil {
+		return fmt.Errorf("bulk request に失敗した: %w", err)
+	}
+	items := res.Failed()
+	// Errors が立っているのに失敗した項目が無い応答を成功として扱わない。
+	//
+	// Failed() は Items が nil なら nil を返し、status が 2xx 以外の項目
+	// だけを拾う。errors=true で items が空の応答では、このループが 1 度も
+	// 回らず、全件が拒否されていても成功になる。件数を数える対象が無い
+	// 以上、ここは中断して呼び出し側に返すしかない。
+	if res.Errors && len(items) == 0 {
+		return errors.New("bulk レスポンスが errors=true を返したが失敗した項目が無い")
+	}
+	for _, item := range items {
+		*failed++
+		if *firstFailure == "" {
+			*firstFailure = describeBulkFailure(item)
+		}
+	}
+	return nil
+}
+
+// maxReasonLen は拒否の理由を切り詰める長さである。
+//
+// ES の Reason にはドキュメントのフィールド値が
+// "Preview of field's value: '...'" として埋め込まれる。この preview は
+// ES 側で切り詰められず、5000 文字のフィールド値は 5000 文字の理由になる。
+// 理由の情報価値は先頭の type とフィールド名にあり、末尾の値そのものは
+// デバッグにほとんど寄与しない。
+const maxReasonLen = 200
+
+// describeBulkFailure は拒否されたドキュメント 1 件の理由を 1 行にする。
+//
+// Reason はドキュメント由来の文字列を含む。エラーは Execute() が標準出力へ
+// 書くため、切り詰めずに渡すと業務データが CI のログや端末の履歴に残る。
+// 利用者がエラー全文を Issue に貼ると、そのまま公開される。
+// 全件分の理由を出す変更を入れる場合も、この点を踏まえること。
+func describeBulkFailure(item *elastic.BulkResponseItem) string {
+	if item == nil {
+		return "unknown"
+	}
+	if item.Error == nil {
+		return fmt.Sprintf("_id=%s status=%d", item.Id, item.Status)
+	}
+	return fmt.Sprintf("_id=%s status=%d type=%s reason=%s", item.Id, item.Status, item.Error.Type, truncateReason(item.Error.Reason))
+}
+
+// truncateReason は理由を maxReasonLen で切り詰める。
+//
+// 切り詰めたことが分かるようにする。切り詰めた跡がないと、理由が元から
+// そこで終わっているのか、続きがあるのか区別できない。
+func truncateReason(reason string) string {
+	// バイト数ではなく文字数で数える。マルチバイト文字の途中で切ると
+	// 不正なバイト列になる。
+	runes := []rune(reason)
+	if len(runes) <= maxReasonLen {
+		return reason
+	}
+	return string(runes[:maxReasonLen]) + "...(truncated)"
 }
 // fetchSlice は 1 本の scroll を読み切り、ヒットを dataChan へ送る。
 //

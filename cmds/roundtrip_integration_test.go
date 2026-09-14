@@ -2,12 +2,14 @@ package cmds
 
 import (
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/olivere/elastic/v7"
@@ -258,5 +260,190 @@ func Test_ImportData_OpenError(t *testing.T) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("os.ErrNotExist を期待した: got %v", err)
+	}
+}
+
+// seedIndexWithMapping は明示したマッピングでインデックスを作り直す。
+//
+// bulk の拒否を再現するために使う。マッピングと矛盾する型の値を送ると
+// ES は mapper_parsing_exception でそのドキュメントだけを拒否する。
+// リクエスト自体は 200 で返るため、Do() の戻り値のエラーには現れない。
+func seedIndexWithMapping(t *testing.T, esUrl, indexName string, mapping map[string]interface{}) {
+	t.Helper()
+
+	// seedIndex と同じガードを通す。DeleteIndex は復旧不能である。
+	assertLocalTestEndpoint(t, esUrl)
+	if !strings.HasPrefix(indexName, testIndexPrefix) {
+		t.Fatalf("テスト用インデックス名は %q で始める必要がある: %s", testIndexPrefix, indexName)
+	}
+
+	ctx := context.Background()
+	client := getEsClient(esUrl)
+
+	if _, err := client.DeleteIndex(indexName).Do(ctx); err != nil {
+		if !elastic.IsNotFound(err) {
+			t.Fatalf("インデックス %s の削除に失敗した: %s", indexName, err)
+		}
+	}
+
+	body := map[string]interface{}{
+		"settings": map[string]interface{}{
+			"number_of_shards":   1,
+			"number_of_replicas": 0,
+		},
+		"mappings": mapping,
+	}
+	if _, err := client.CreateIndex(indexName).BodyJson(body).Do(ctx); err != nil {
+		t.Fatalf("インデックス %s の作成に失敗した: %s", indexName, err)
+	}
+}
+
+// writeGzipLines は JSON Lines を gzip で書き出し、そのパスを返す。
+func writeGzipLines(t *testing.T, lines []string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "dump.json.gz")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("テスト用ファイルの作成に失敗した: %s", err)
+	}
+	defer f.Close()
+	zw := gzip.NewWriter(f)
+	for _, line := range lines {
+		if _, err := zw.Write([]byte(line + "\n")); err != nil {
+			t.Fatalf("テスト用ファイルの書き込みに失敗した: %s", err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip の Close に失敗した: %s", err)
+	}
+	return path
+}
+
+// Test_ImportData_AllDocsRejected は全件が ES に拒否された場合にエラーを
+// 返すことを確認する。
+//
+// 以前は 1 件も入らなくても "finish import row count N" を出して exit 0 で
+// 終わっていた。bulk のレスポンスは items ごとに error を持つが、これを
+// 見ずに Do() の戻り値だけを見ていたためである。件数を報告する分、cron や
+// CI のログ上は成功したように読める。
+func Test_ImportData_AllDocsRejected(t *testing.T) {
+	esUrl := requireEs(t)
+
+	indexName := testIndexPrefix + "import_rejected"
+	// n を integer に固定する。文字列を送ると必ず拒否される。
+	seedIndexWithMapping(t, esUrl, indexName, map[string]interface{}{
+		"properties": map[string]interface{}{
+			"n": map[string]interface{}{"type": "integer"},
+		},
+	})
+
+	withImportDefaults(t)
+
+	dump := writeGzipLines(t, []string{
+		`{"_index":"x","_id":"a","_score":1,"_source":{"n":"not-an-integer"}}`,
+		`{"_index":"x","_id":"b","_score":1,"_source":{"n":"also-bad"}}`,
+	})
+
+	err := ImportData(dump, esUrl, indexName)
+	if err == nil {
+		t.Fatal("全件が拒否されたのにエラーが返らなかった")
+	}
+	// 件数と理由が分かること。件数だけでは原因を追えない。
+	if !strings.Contains(err.Error(), "2 / 2") {
+		t.Errorf("拒否された件数がエラーに含まれない: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mapper_parsing_exception") {
+		t.Errorf("拒否の理由がエラーに含まれない: %v", err)
+	}
+
+	if got := countDocs(t, esUrl, indexName); got != 0 {
+		t.Errorf("拒否されたはずのドキュメントが %d 件入っている", got)
+	}
+}
+
+// Test_ImportData_PartialReject は一部だけが拒否された場合にエラーを返しつつ、
+// 残りは import することを確認する。
+//
+// 不正な行が混ざっていても、入れられる分は入れ切るほうが実用的である。
+// ただし黙って落とすと取りこぼしに気づけないため、戻り値では失敗にする。
+func Test_ImportData_PartialReject(t *testing.T) {
+	esUrl := requireEs(t)
+
+	indexName := testIndexPrefix + "import_partial"
+	seedIndexWithMapping(t, esUrl, indexName, map[string]interface{}{
+		"properties": map[string]interface{}{
+			"n": map[string]interface{}{"type": "integer"},
+		},
+	})
+
+	withImportDefaults(t)
+
+	dump := writeGzipLines(t, []string{
+		`{"_index":"x","_id":"ok1","_score":1,"_source":{"n":1}}`,
+		`{"_index":"x","_id":"bad","_score":1,"_source":{"n":"not-an-integer"}}`,
+		`{"_index":"x","_id":"ok2","_score":1,"_source":{"n":2}}`,
+	})
+
+	err := ImportData(dump, esUrl, indexName)
+	if err == nil {
+		t.Fatal("一部が拒否されたのにエラーが返らなかった")
+	}
+	if !strings.Contains(err.Error(), "1 / 3") {
+		t.Errorf("拒否された件数がエラーに含まれない: %v", err)
+	}
+
+	// 拒否されなかった 2 件は入っていること。1 件の失敗で全体を捨てない。
+	if got := countDocs(t, esUrl, indexName); got != 2 {
+		t.Errorf("成功した分が import されていない: got %d, want 2", got)
+	}
+}
+
+// Test_ImportData_Success は拒否がなければエラーを返さないことを確認する。
+//
+// 拒否の検出を入れたことで、正常な import まで失敗扱いにしていないかを見る。
+func Test_ImportData_Success(t *testing.T) {
+	esUrl := requireEs(t)
+
+	indexName := testIndexPrefix + "import_success"
+	seedIndex(t, esUrl, indexName, 0, 1)
+
+	withImportDefaults(t)
+
+	dump := writeGzipLines(t, []string{
+		`{"_index":"x","_id":"a","_score":1,"_source":{"n":1}}`,
+		`{"_index":"x","_id":"b","_score":1,"_source":{"n":2}}`,
+	})
+
+	if err := ImportData(dump, esUrl, indexName); err != nil {
+		t.Fatalf("正常な import でエラーが返った: %s", err)
+	}
+	if got := countDocs(t, esUrl, indexName); got != 2 {
+		t.Errorf("import された件数が違う: got %d, want 2", got)
+	}
+}
+
+// Test_ImportData_BrokenLine は解釈できない行でエラーを返すことを確認する。
+//
+// エラーに行番号を含める。大きなダンプで「どこかが壊れている」とだけ
+// 言われても、原因の行を探せない。
+func Test_ImportData_BrokenLine(t *testing.T) {
+	esUrl := requireEs(t)
+
+	indexName := testIndexPrefix + "import_broken"
+	seedIndex(t, esUrl, indexName, 0, 1)
+
+	withImportDefaults(t)
+
+	dump := writeGzipLines(t, []string{
+		`{"_index":"x","_id":"a","_score":1,"_source":{"n":1}}`,
+		`{"_index":"x","_id":"b",`,
+	})
+
+	err := ImportData(dump, esUrl, indexName)
+	if err == nil {
+		t.Fatal("壊れた行でエラーが返らなかった")
+	}
+	if !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("エラーに行番号が含まれない: %v", err)
 	}
 }
