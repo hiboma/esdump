@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.0.4](https://github.com/hiboma/esdump/compare/v0.0.3...v0.0.4) - 2026-09-14
+
+- サプライチェーン対策: ビルドとリリース経路の hardening by @hiboma in https://github.com/hiboma/esdump/pull/13
+- docs: document every difference from upstream in FORK.md by @hiboma in https://github.com/hiboma/esdump/pull/15
+- fix: let rejected documents reach the import exit code by @hiboma in https://github.com/hiboma/esdump/pull/16
+
 ## [v0.0.3](https://github.com/hiboma/esdump/compare/v0.0.2...v0.0.3) - 2026-09-08
 
 - Test export against a real OpenSearch, and fix the four bugs it found by @hiboma in https://github.com/hiboma/esdump/pull/11
